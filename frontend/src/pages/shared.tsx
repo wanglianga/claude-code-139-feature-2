@@ -135,11 +135,14 @@ export function AppealDetailModal({ id, onClose, onChanged }: { id: number; onCl
   const [msg, setMsg] = useState('');
   const [err, setErr] = useState('');
 
-  useEffect(() => {
+  const reload = () =>
     api('GET', `/appeals/${id}`).then((x) => {
       setD(x);
-      setRuling(x.adjudication?.ruling ?? '');
-    }).catch((e) => setErr(e.message));
+      setRuling((r) => r || x.adjudication?.ruling || '');
+    });
+
+  useEffect(() => {
+    reload().catch((e) => setErr(e.message));
   }, []);
 
   if (err) return <Modal title="申诉详情" onClose={onClose}><div className="alert error">{err}</div></Modal>;
@@ -148,9 +151,10 @@ export function AppealDetailModal({ id, onClose, onChanged }: { id: number; onCl
   const submitRule = async () => {
     setErr(''); setMsg('');
     try {
-      await api('POST', `/appeals/${id}/rule`, { ruling, note });
-      setMsg('终裁已提交，可在结算页重算分账');
+      const r = await api('POST', `/appeals/${id}/rule`, { ruling, note });
+      setMsg(r.violation ? `终裁已提交；占位燃油车无有效预约，已登记违约（罚金/押金/信用/挂账追缴）` : '终裁已提交，可在结算页重算分账');
       onChanged?.();
+      await reload();
     } catch (e: any) {
       setErr(e.message);
     }
@@ -167,21 +171,44 @@ export function AppealDetailModal({ id, onClose, onChanged }: { id: number; onCl
   };
 
   return (
-    <Modal wide title={<span>错停申诉裁决 · {d.code} <RulingTag ruling={d.ruling} /></span>} onClose={onClose}>
+    <Modal wide title={<span>{d.appeal_type === 'charging_occupy' ? '⚡ 充电车位错占申诉裁决' : '错停申诉裁决'} · {d.code} <RulingTag ruling={d.ruling} /></span>} onClose={onClose}>
       <div className="grid grid-2">
         <div>
           <div className="card" style={{ marginTop: 0 }}>
             <h3>申诉内容</h3>
             <div className="small muted">{d.appellant_name} · {d.plate} · 车位 {d.spot_code} · {dt(d.created_at)}</div>
             <p>{d.reason}</p>
+            {d.appeal_type === 'charging_occupy' && <ChargingAppealInfo d={d} />}
             {d.ruling_note && <div className="alert info">终裁说明：{d.ruling_note}</div>}
           </div>
           <div className="card">
-            <h3>证据链 <span className="hint">车牌识别 / 预约 / 照片 / 道闸日志 / 业主回家 / 巡查</span></h3>
+            <h3>证据链 <span className="hint">入场记录 / 现场照片 / 预约 / 巡查 …</span></h3>
             <EvidenceList items={d.evidence} />
           </div>
+          {d.violations?.length > 0 && (
+            <div className="card">
+              <h3>违约记录（占位燃油车）</h3>
+              {d.violations.map((v: any) => (
+                <div key={v.id} className="ticket-card open">
+                  <div className="ticket-head">
+                    <span className="ticket-title mono">{v.plate}</span>
+                    <span className="btn-row">
+                      <Tag cls={v.has_valid_reservation ? 'gray' : 'red'} label={v.has_valid_reservation ? '有预约·待核查' : '无有效预约'} />
+                      <Tag status={v.status === 'waived' ? 'closed' : 'resolved'} />
+                    </span>
+                  </div>
+                  <div className="ticket-desc">{v.description}</div>
+                  <div className="small muted">
+                    违约金 ¥{v.fine} · 押金抵扣 ¥{v.deposit_deducted} · 挂账追缴 ¥{v.amount_outstanding} · 信用 {v.credit_delta}
+                    {v.user_id ? ` · 已落账车主 #${v.user_id}` : ' · 系统无该车牌账号，挂账追缴'}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
         <div>
+          {d.appeal_type === 'charging_occupy' && <ChargingHandlePanel d={d} onAction={async () => { setMsg('物业处置已记录'); await reload(); onChanged?.(); }} />}
           <div className="card" style={{ marginTop: 0 }}>
             <h3>自动责任分析</h3>
             <AdjudicationPanel a={d.adjudication} />
@@ -204,7 +231,7 @@ export function AppealDetailModal({ id, onClose, onChanged }: { id: number; onCl
                     <option value="owner_fault">业主责任（补偿车主 + 业主信用 -5）</option>
                     <option value="property_fault">物业责任（赔付券 + 物业信用 -5）</option>
                     <option value="platform_fault">平台责任（免单/赔付券）</option>
-                    <option value="stranger">陌生车主责任（平台兜底，向其追缴）</option>
+                    <option value="stranger">陌生/占位车主责任（平台兜底，向其追缴；无有效预约记违约）</option>
                     <option value="mixed">混合责任（车主信用 -5）</option>
                     <option value="no_fault">无责/证据不足</option>
                   </select>
@@ -220,5 +247,105 @@ export function AppealDetailModal({ id, onClose, onChanged }: { id: number; onCl
         </div>
       </div>
     </Modal>
+  );
+}
+
+// 充电位错占：现场三要素 + 系统调取的入场记录 + 补电补偿试算
+function ChargingAppealInfo({ d }: { d: any }) {
+  const entry = d.occupying_entry;
+  const rc = d.recharge_preview;
+  return (
+    <div className="alert info" style={{ marginTop: 10 }}>
+      <div className="spot-tags">
+        <Tag cls="purple" label={`充电桩 ${d.charger_code}`} />
+        <Tag cls="cyan" label={`到达 ${dt(d.arrived_at)}`} />
+        <Tag cls="red" label={`占位燃油车 ${d.occupying_plate}`} />
+        {d.alt_charger_code && <Tag cls="green" label={`替代桩 ${d.alt_charger_code}`} />}
+      </div>
+      <div style={{ marginTop: 8 }}>
+        <b>占用车辆入场记录（系统自动调取）：</b>
+        {entry?.entry ? (
+          <span>{entry.entry.gate} · {dt(entry.entry.occurred_at)} · {
+            entry.entry.type === 'manual_release' ? '物业人工放行'
+              : entry.entry.type === 'recognition_fail' ? '识别无匹配/疑似跟车入场（留有影像）'
+                : '车牌识别放行'}
+            {entry.validReservation
+              ? ' · 该车存在有效预约（转人工核查，不直接记违约）'
+              : ' · 该车无有效预约（终裁成立即登记违约）'}
+          </span>
+        ) : <span>未检索到任何道闸事件（疑似跟车入场），无有效预约，物业需核查人工/跟车通道。</span>}
+      </div>
+      {rc && (
+        <div style={{ marginTop: 8 }}>
+          <b>补电补偿：</b>期望 {d.requested_kwh}kWh / 实际 {rc.kwhGap ? Math.max(0, Number(d.requested_kwh) - rc.kwhGap) : d.requested_kwh}kWh
+          ，未充满缺口 <b>{rc.kwhGap}kWh</b>，离场结算补偿 <b>{money(rc.compensation)}</b>
+          <div className="small muted">{(rc.notes ?? []).join('；')}</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// 物业接单处置：联系挪车 / 安排替代充电桩 / 免除预约费
+function ChargingHandlePanel({ d, onAction }: { d: any; onAction: () => void }) {
+  const [altCharger, setAltCharger] = useState('');
+  const [note, setNote] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const actions: any[] = d.property_actions ?? [];
+  const done = (a: string) => actions.some((x) => x.action === a);
+
+  const handle = async (action: string) => {
+    setErr(''); setBusy(true);
+    try {
+      if (action === 'alternative_charger' && !altCharger.trim()) { setErr('请填写替代充电桩编号'); setBusy(false); return; }
+      await api('POST', `/appeals/${d.id}/handle`, {
+        action,
+        alt_charger_code: action === 'alternative_charger' ? altCharger : undefined,
+        note: note || undefined,
+      });
+      setNote('');
+      onAction();
+    } catch (e: any) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const ACTION_LABEL: Record<string, string> = {
+    contact_move: '联系燃油车主挪车',
+    alternative_charger: '安排替代充电桩',
+    waive_fee: '免除本次预约费用',
+  };
+
+  return (
+    <div className="card">
+      <h3>物业接单处置 <span className="hint">可多项叠加</span></h3>
+      {err && <div className="alert error">{err}</div>}
+      {actions.length > 0 && (
+        <div className="small" style={{ marginBottom: 8 }}>
+          已处置：{actions.map((a) => `${ACTION_LABEL[a.action]}${a.alt_charger_code ? `（${a.alt_charger_code}）` : ''}`).join('、')}
+        </div>
+      )}
+      <div className="btn-row">
+        <button className="btn sm" disabled={busy || done('contact_move')} onClick={() => handle('contact_move')}>📞 联系挪车（App+LED 通知）</button>
+        <button className="btn sm success" disabled={busy || done('alternative_charger')} onClick={() => handle('alternative_charger')}>⚡ 安排替代充电桩</button>
+        <button className="btn sm gray" disabled={busy || done('waive_fee')} onClick={() => handle('waive_fee')}>💰 免除预约费</button>
+      </div>
+      {!done('alternative_charger') && (
+        <div className="field" style={{ marginTop: 8 }}>
+          <label>替代充电桩编号</label>
+          <input value={altCharger} onChange={(e) => setAltCharger(e.target.value)} placeholder="如 CP-B2-110-1（相邻空闲充电位）" />
+        </div>
+      )}
+      <div className="field"><label>处置备注</label>
+        <input value={note} onChange={(e) => setNote(e.target.value)} placeholder="如 10 分钟内车主挪车 / 已引导至替代桩" />
+      </div>
+      <div className="small muted">
+        终裁占位车主责任且其无有效预约时：违约金 ¥200 优先扣押金、不足挂账追缴，信用 -10；
+        有未结清欠款或信用低于 60 将冻结后续预约，有占位违约史的再次预约需 ¥200 押金。
+      </div>
+    </div>
   );
 }

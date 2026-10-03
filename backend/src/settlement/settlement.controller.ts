@@ -4,6 +4,7 @@ import { JwtUser } from '../auth/auth.service';
 import { DbService } from '../database/db.service';
 import { Ruling, settlePrice, SettlementBreakdown } from '../domain/pricing';
 import { buildSpotTimeline, TimelineIncident, TimelineOrder } from '../domain/timeline';
+import { calcRechargeCompensation } from '../domain/recharge';
 
 class ExitDto {
   charge_kwh?: number;
@@ -41,6 +42,15 @@ export class SettlementController {
 
       const breakdown = await this.computeBreakdown(c, r, exitAt, dto.charge_kwh ?? 0);
       const settlement = await this.persistSettlement(c, r, exitAt, breakdown);
+
+      // 持久化充电会话（补电补偿重算时以实际充电量为准）
+      if (dto.charge_kwh && dto.charge_kwh > 0) {
+        await c.query(
+          `INSERT INTO service_events(reservation_id, spot_id, type, actor_id, actor_role, plate, detail)
+           VALUES ($1,$2,'charging_session',$3,$4,$5,$6)`,
+          [id, r.spot_id, user.sub, user.role, r.plate, JSON.stringify({ kwh: dto.charge_kwh })],
+        );
+      }
 
       // 信用分
       if (breakdown.creditTarget !== 'none' && breakdown.creditDelta !== 0) {
@@ -352,6 +362,33 @@ export class SettlementController {
       kwh = Number(detail.rows[0]?.detail?.kwh ?? 0);
     }
 
+    // 充电位错占申诉：物业"免除预约费"动作 + 按实际充电量重算的补电补偿
+    let waiveReservationFee = false;
+    let rechargeCompensation = 0;
+    let rechargeKwhGap = 0;
+    const chargeAppealQ = await client.query(
+      `SELECT id, property_actions, requested_kwh, actual_kwh, recharge_compensation
+       FROM appeals WHERE reservation_id=$1 AND appeal_type='charging_occupy'
+       ORDER BY id DESC LIMIT 1`,
+      [r.id],
+    );
+    const chargeAppeal = chargeAppealQ.rows[0];
+    if (chargeAppeal) {
+      const actions: any[] = Array.isArray(chargeAppeal.property_actions) ? chargeAppeal.property_actions : [];
+      waiveReservationFee = actions.some((a) => a.action === 'waive_fee');
+      // 替代充电桩安排后，实际充入电量提升；以实际充电会话 kwh 重算未充满缺口
+      const recharge = calcRechargeCompensation({
+        requestedKwh: Number(chargeAppeal.requested_kwh ?? 0),
+        actualKwh: kwh,
+      });
+      rechargeCompensation = recharge.compensation;
+      rechargeKwhGap = recharge.kwhGap;
+      await client.query(
+        `UPDATE appeals SET actual_kwh=$2, recharge_compensation=$3 WHERE id=$1`,
+        [chargeAppeal.id, kwh, rechargeCompensation],
+      );
+    }
+
     return settlePrice({
       reservedStart: r.start_at,
       reservedEnd: r.end_at,
@@ -366,6 +403,9 @@ export class SettlementController {
       ruling,
       couponAmount,
       prepaid: Number(r.estimated_fee && couponAmount ? Math.max(0, Number(r.estimated_fee) - couponAmount) : (r.estimated_fee ?? 0)),
+      waiveReservationFee,
+      rechargeCompensation,
+      rechargeKwhGap,
     });
   }
 
@@ -383,9 +423,9 @@ export class SettlementController {
          duration_minutes, base_fee, charging_fee, overtime_fee, wrong_park_fine,
          coupon_discount, abnormal_compensation, coupon_compensation, owner_compensation, prepaid, refund, exit_charge, payable,
          owner_income, property_fee, platform_fee, owner_share, property_share, platform_share,
-         credit_target, credit_delta, appeal_id, ruling, detail)
+         credit_target, credit_delta, appeal_id, ruling, recharge_compensation, recharge_kwh_gap, detail)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
-               $19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)
+               $19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32)
        RETURNING *`,
       [
         code, r.id, r.spot_id, b.actualEntryAt, b.actualExitAt, b.usableFrom,
@@ -393,6 +433,7 @@ export class SettlementController {
         b.couponDiscount, b.abnormalCompensation, b.couponCompensation, b.ownerCompensation, b.prepaid, b.refund, b.exitCharge, b.payable,
         b.ownerIncome, b.propertyFee, b.platformFee, b.ownerShare, b.propertyShare, b.platformShare,
         b.creditTarget, b.creditDelta, appealId ?? null, ruling ?? b.ruling,
+        b.rechargeCompensation, b.rechargeKwhGap,
         JSON.stringify({ notes: b.notes }),
       ],
     );

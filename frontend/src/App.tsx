@@ -51,9 +51,10 @@ function Login({ onLogin }: { onLogin: (s: any) => void }) {
 
   const accounts = [
     { u: 'owner1', label: '业主 王业主', desc: '发布车位 · 临时回家' },
-    { u: 'driver1', label: '车主 陈车主', desc: '新能源月租 · 申诉' },
+    { u: 'driver1', label: '车主 陈车主', desc: '新能源月租 · 充电位错占申诉' },
     { u: 'driver2', label: '访客 赵访客', desc: '访客车辆 · 超时/错停' },
-    { u: 'property1', label: '物业 小周', desc: '审核 · 调度 · 裁决' },
+    { u: 'driver3', label: '燃油车 孙燃油', desc: '占位违约 · 押金/预约权限' },
+    { u: 'property1', label: '物业 小周', desc: '审核 · 调度 · 接单处置 · 裁决' },
     { u: 'admin1', label: '管理员', desc: '分账监管 · 发券' },
   ];
 

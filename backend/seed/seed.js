@@ -49,6 +49,7 @@ async function main() {
   const owner2 = await user('owner2', '李业主', 'owner', '13800000002');
   const driver = await user('driver1', '陈车主', 'driver', '13900000001');
   const driver2 = await user('driver2', '赵访客', 'driver', '13900000002');
+  const driver3 = await user('driver3', '孙燃油', 'driver', '13900000003');
   const property = await user('property1', '物业值班员小周', 'property', '13700000001');
   await user('admin1', '平台管理员', 'admin', '13600000001');
 
@@ -112,6 +113,8 @@ async function main() {
   }
   await vehicle(driver.id, '沪AD88899', { color: '绿牌', ne: true, monthly: true });
   await vehicle(driver2.id, '沪A12345', { visitor: true });
+  // 燃油车车主（无新能源）：演示占用充电位违约对预约权限/押金的影响
+  await vehicle(driver3.id, '沪AF66688', { color: '蓝牌', ne: false });
 
   // 优惠券
   await pool.query(
@@ -123,7 +126,7 @@ async function main() {
 
   console.log('SEED_OK');
   console.log('测试账号（密码均为 Pass1234）：');
-  console.log('  owner1 / driver1 / driver2 / property1 / admin1');
+  console.log('  owner1 / driver1 / driver2 / driver3 / property1 / admin1');
   await pool.end();
 }
 

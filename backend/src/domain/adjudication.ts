@@ -99,6 +99,7 @@ export function adjudicateAppeal(input: AdjudicationInput): AdjudicationResult {
 
   // ---- 道闸日志：识别失败/人工放行 ----
   const gateLogs = input.evidence.filter((e) => e.source === 'gate_log');
+  const iceContext = input.incidents.some((i) => i.type === 'ice_occupy_charger');
   let manualRelease = false;
   let recognitionFail = false;
   for (const e of gateLogs) {
@@ -107,7 +108,8 @@ export function adjudicateAppeal(input: AdjudicationInput): AdjudicationResult {
       // 仅当陌生车经人工放行进入时才计入物业过失（见下方组合规则）
       manualRelease = true;
     }
-    if (/识别失败|无匹配|重试失败/i.test(e.content)) {
+    // 充电位被燃油车错占场景中，占用车自身的识别失败/跟车记录不是平台服务瑕疵
+    if (/识别失败|无匹配|重试失败/i.test(e.content) && !iceContext) {
       recognitionFail = true;
       scorecard.platform_fault += SOURCE_WEIGHT.gate_log * 0.6;
       reasons.push('道闸发生车牌识别失败，可能导致引导/入场异常');
@@ -166,6 +168,27 @@ export function adjudicateAppeal(input: AdjudicationInput): AdjudicationResult {
   }
   if (input.evidence.some((e) => e.source === 'signal')) {
     scorecard.platform_fault += 0.3;
+  }
+
+  // ---- 燃油车占用充电位（新能源车主专项申诉）----
+  // 系统证据（道闸入场记录/巡查）权重最高，车主现场照片次之；两类同时存在时证据充分
+  const iceSystem = input.evidence.some(
+    (e) =>
+      ['gate_log', 'patrol', 'plate_recognition'].includes(e.source) &&
+      /燃油车|油车|ICE|占用充电|充电桩被|无有效预约/i.test(e.content),
+  );
+  const icePhoto = input.evidence.some(
+    (e) =>
+      e.source === 'photo' &&
+      /燃油车|油车|ICE|占用充电|充电桩被/i.test(e.content),
+  );
+  const iceIncident = input.incidents.some((i) => i.type === 'ice_occupy_charger');
+  if (iceIncident || iceSystem) {
+    scorecard.stranger += 0.9;
+    reasons.push('道闸入场记录/巡查证据显示燃油车占用带充电桩车位，占位燃油车主承担违约责任（无有效预约时记违约并影响预约权限、押金）');
+  } else if (icePhoto) {
+    scorecard.stranger += 0.5;
+    reasons.push('车主现场照片显示燃油车占用充电位，待物业结合道闸入场记录复核');
   }
 
   // ---- 预约记录：时间窗匹配性 ----

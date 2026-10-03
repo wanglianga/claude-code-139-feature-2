@@ -3,6 +3,7 @@ import { AuthGuard, CurrentUser, Roles } from '../auth/auth.guard';
 import { JwtUser } from '../auth/auth.service';
 import { DbService } from '../database/db.service';
 import { estimateFee, isIntervalCovered, ShareWindow } from '../domain/availability';
+import { decideReservationAccess } from '../domain/policy';
 
 function code(prefix: string) {
   return `${prefix}${Date.now().toString(36).toUpperCase()}${Math.floor(Math.random() * 1e4)
@@ -48,6 +49,100 @@ export class ReservationsController {
         [user.sub],
       )
       .then((r) => r.rows);
+  }
+
+  // 车主押金与预约权限状态（含违约欠款）
+  @Roles('driver')
+  @Get('deposit')
+  async deposit(@CurrentUser() user: JwtUser) {
+    const u = (await this.db.query(
+      `SELECT id, credit_score, deposit_balance, outstanding_amount FROM users WHERE id=$1`,
+      [user.sub],
+    )).rows[0];
+    const v = await this.db.query(
+      `SELECT type, has_valid_reservation, created_at FROM violation_records
+       WHERE user_id=$1 AND status <> 'waived'`,
+      [user.sub],
+    );
+    const decision = decideReservationAccess({
+      creditScore: Number(u.credit_score),
+      depositBalance: Number(u.deposit_balance),
+      outstandingAmount: Number(u.outstanding_amount),
+      violations: v.rows.map((x: any) => ({
+        type: x.type,
+        hasValidReservation: x.has_valid_reservation,
+        createdAt: x.created_at,
+      })),
+    });
+    return { ...u, access: decision };
+  }
+
+  // 车主充值押金 / 补缴欠款（模拟支付：欠款优先抵扣，余额入押金）
+  @Roles('driver')
+  @Post('deposit/topup')
+  async depositTopup(@CurrentUser() user: JwtUser, @Body() body: { amount: number }) {
+    const amount = Number(body.amount);
+    if (!(amount > 0)) throw new BadRequestException('充值金额非法');
+    return this.db.withTx(async (c) => {
+      const u = (await c.query(
+        `SELECT deposit_balance, outstanding_amount FROM users WHERE id=$1 FOR UPDATE`,
+        [user.sub],
+      )).rows[0];
+      const payDebt = Math.min(amount, Number(u.outstanding_amount));
+      const toDeposit = amount - payDebt;
+      await c.query(
+        `UPDATE users SET outstanding_amount=outstanding_amount - $2,
+           deposit_balance=deposit_balance + $3 WHERE id=$1`,
+        [user.sub, payDebt, toDeposit],
+      );
+      if (payDebt > 0) {
+        await c.query(
+          `UPDATE violation_records SET status='collected', resolved_at=now()
+           WHERE user_id=$1 AND amount_outstanding > 0 AND status IN ('open','recorded','deducted')`,
+          [user.sub],
+        );
+      }
+      const fresh = (await c.query(
+        `SELECT credit_score, deposit_balance, outstanding_amount FROM users WHERE id=$1`,
+        [user.sub],
+      )).rows[0];
+      return { ok: true, paid_debt: payDebt, deposit_added: toDeposit, ...fresh };
+    });
+  }
+
+  // 违约记录：车主看本人，业主看本人物业车位，物业/管理员看全部
+  @Get('violations')
+  async violations(@CurrentUser() user: JwtUser, @Query('plate') plate?: string) {
+    if (user.role === 'driver') {
+      return this.db
+        .query(
+          `SELECT v.*, s.code AS spot_code FROM violation_records v
+           LEFT JOIN parking_spots s ON s.id=v.spot_id
+           WHERE v.user_id=$1 ORDER BY v.created_at DESC LIMIT 100`,
+          [user.sub],
+        )
+        .then((q) => q.rows);
+    }
+    const params: any[] = [];
+    let where = '1=1';
+    if (user.role === 'owner') {
+      params.push(user.sub);
+      where = `s.owner_id=$${params.length}`;
+    }
+    if (plate) {
+      params.push(plate.replace(/[^0-9A-Z一-龥]/gi, '').toUpperCase());
+      where += ` AND REPLACE(REPLACE(UPPER(v.plate),' ',''),'-','')=$${params.length}`;
+    }
+    return this.db
+      .query(
+        `SELECT v.*, s.code AS spot_code, u.name AS user_name
+         FROM violation_records v
+         LEFT JOIN parking_spots s ON s.id=v.spot_id
+         LEFT JOIN users u ON u.id=v.user_id
+         WHERE ${where} ORDER BY v.created_at DESC LIMIT 200`,
+        params,
+      )
+      .then((q) => q.rows);
   }
 
   // 管理员/平台发放补偿券（错停申诉结案、信号差赔付等场景）
@@ -99,6 +194,30 @@ export class ReservationsController {
       if (!spot) throw new BadRequestException('车位不存在');
       if (spot.review_status !== 'approved') throw new BadRequestException('车位尚未通过物业审核');
       if (!spot.active) throw new BadRequestException('车位已停止共享');
+
+      // 预约权限与押金校验：未结清欠款/信用过低冻结；占位违约史（含已追缴，回溯期内）提高押金门槛
+      const uq = await c.query(
+        `SELECT credit_score, deposit_balance, outstanding_amount FROM users WHERE id=$1 FOR UPDATE`,
+        [user.sub],
+      );
+      const vq = await c.query(
+        `SELECT type, has_valid_reservation, created_at FROM violation_records
+         WHERE user_id=$1 AND status <> 'waived'`,
+        [user.sub],
+      );
+      const decision = decideReservationAccess({
+        creditScore: Number(uq.rows[0].credit_score),
+        depositBalance: Number(uq.rows[0].deposit_balance),
+        outstandingAmount: Number(uq.rows[0].outstanding_amount),
+        violations: vq.rows.map((x: any) => ({
+          type: x.type,
+          hasValidReservation: x.has_valid_reservation,
+          createdAt: x.created_at,
+        })),
+      });
+      if (!decision.allowed) {
+        throw new BadRequestException('暂不可预约：' + decision.reasons.join('；'));
+      }
 
       // 访客车辆规则
       const vehRes = await c.query(`SELECT * FROM vehicles WHERE id=$1 AND user_id=$2`, [

@@ -79,7 +79,8 @@ npm run dev
 | `owner2` | 业主 | 李业主 | 第二个业主（含禁访客车位、待审核车位） |
 | `driver1` | 外来车主 | 陈车主 | 新能源**月租车** `沪AD88899`，预约充电位、申诉、领券 |
 | `driver2` | 外来车主 | 赵访客 | **访客车** `沪A12345`，访客超时/错停场景 |
-| `property1` | 物业 | 值班员小周 | 车位审核、道闸人工放行、夜巡、挪车通知、申诉终裁 |
+| `driver3` | 外来车主 | 孙燃油 | 燃油车车主，演示占位违约对预约权限与押金的影响（冒烟脚本另动态注册独立燃油车账号） |
+| `property1` | 物业 | 值班员小周 | 车位审核、道闸人工放行、夜巡、挪车通知、申诉终裁、违约追缴 |
 | `admin1` | 平台管理员 | 平台管理员 | 分账监管、资金流水、发补偿券、全局订单追溯 |
 
 种子还包含：阳光花园社区、3 个已审核共享车位（充电位 `B2-108`、普通位 `B2-109`、禁访位 `B1-021`）、
@@ -115,6 +116,21 @@ npm run dev
 - 责任建议：车主 / 业主 / 物业 / 平台 / 陌生车主 / 混合 / 存疑，含置信度、各方责任得分条与逐条理由、证据时间线；
 - 物业可采纳建议或**人工改判**；终裁后可**一键重算分账**（自动反向冲销旧信用影响再施加新的）。
 
+### 充电车位错占申诉（新能源车主发起 / 物业接单处置）
+新能源车预约带充电桩车位、到场发现被燃油车占用时的专项闭环（`appeal_type=charging_occupy`）：
+1. **车主提交三要素（必填）**：现场照片（至少 1 张）、**现场充电桩编号**、**到达时间**，并填写占位燃油车车牌与本次期望充电量（充满所需 kWh）。
+2. **平台自动调取占用车辆入场记录**：按车牌+到达时间窗检索道闸事件（识别放行 / 物业人工放行 / 识别无匹配疑似跟车入场），
+   同时核验其在该时段、该车位**是否有有效预约**，结果固化为 `gate_log` 证据并自动生成"燃油车占充电位"工单进入物业调度看板。
+3. **物业接单三处置（可叠加，全程留痕）**：📞 **联系挪车**（App 推送 + 车位 LED 通知，留挪车通知记录）、
+   ⚡ **安排替代充电桩**（记录替代桩编号）、💰 **免除本次预约费用**（基础停车费全免、预付退还）。
+4. **终裁占位燃油车责任且其无有效预约 → 违约记录**（`violation_records`）：
+   罚金 ¥200、信用 **-10**；罚金**优先从押金扣除，不足挂账追缴**；系统识别到车牌所属账号则落账，否则挂账。
+   纯函数 `domain/policy.ts` 决定后续预约权限：**有未结清欠款 / 信用 < 60 冻结预约**，
+   近 180 天有占位违约史的再次预约需补足 **¥200 押金**（信用良好无违约史免押）。车主可在"车辆与优惠券"页充值押金/补缴欠款。
+5. **补电补偿（未充满）**：纯函数 `domain/recharge.ts` 按
+   `(期望充电量 − 实际充电量) × 充电单价 1.2 元/kWh × 1.5 倍（含找桩/等待附加补偿），单笔封顶 ¥120`
+   计算；离场时以实际充电会话电量重算，作为现金补偿**由平台先行赔付、随后向占位违约车主追缴**，计入资金流水并保持借贷平衡。
+
 ### 计费与收益分账（`src/domain/pricing.ts`，纯函数）
 合并清算：基础停车费（夜间封顶、按实际可用时长）、充电服务费、访客超时费（10 分钟宽限后 1.5×）、
 错停违约金、优惠券抵扣、异常现金补偿、赔付券（非现金）、业主补偿、退款、离场补缴；
@@ -136,21 +152,24 @@ npm run dev
 
 ## 五、本题的验证方式与结果（均已实际执行）
 
-### 后端单元测试（Jest，19 个用例全部通过）
+### 后端单元测试（Jest，35 个用例全部通过）
 ```bash
 cd backend && npm test
 ```
-- `test/pricing.spec.ts`（10 个）：夜间封顶、充电费、访客超时 1.5× 与信用 -3、业主回家实际时长计费+补偿+退款、
+- `test/pricing.spec.ts`（12 个）：夜间封顶、充电费、访客超时 1.5× 与信用 -3、业主回家实际时长计费+补偿+退款、
   车主错停违约金/业主补偿/信用 -10、陌生车平台兜底、优惠券封顶、70/10/20 分成、平台全责全额退款、
-  **四种裁决场景下资金流水借贷平衡**。
-- `test/adjudication.spec.ts`（6 个）：车主错停、业主回家责任、陌生车+人工放行、识别失败+信号差平台责任、
-  证据不足不作自动处罚、证据时间线排序。
+  **四种裁决场景资金流水借贷平衡、补电补偿平台先行赔付流水平衡、物业免除预约费（基础费 0/预付退还）**。
+- `test/adjudication.spec.ts`（7 个）：车主错停、业主回家责任、陌生车+人工放行、识别失败+信号差平台责任、
+  证据不足不作自动处罚、证据时间线排序、**燃油车占充电位（入场记录+工单）判陌生占位车主责任**。
+- `test/recharge.spec.ts`（4 个）：无缺口不补、缺口非负、30kWh 缺口 = 电费 36 + 附加 18 = 54 元、单笔封顶 120。
+- `test/policy.spec.ts`（9 个）：信用良好免押、欠款冻结、信用 < 60 冻结、无有效预约占位违约史押金上浮 200、
+  有有效预约不提门槛、超 180 天回溯窗口失效；押金充足抵扣、不足挂账、零押金全额挂账。
 - `test/timeline.spec.ts`（3 个）：一晚相邻两单归属、陌生车占用段平台兜底/追缴归责、业主回家段业主自用与担责。
 
-### 真实数据库 + HTTP 端到端冒烟（53 项断言全部通过）
+### 真实数据库 + HTTP 端到端冒烟（77 项断言全部通过，脚本可重复执行）
 对运行中的 NestJS（真实 PostgreSQL）执行 `node backend/seed/smoke.mjs`，用道闸时钟参数把事件锚定到"今晚"时间线，端到端覆盖：
 
-1. 四角色登录、业主发布 4 个车位、物业审核、车主按充电桩筛选；
+1. 四角色登录+动态注册燃油车账号、业主发布 5 个车位、物业审核、车主按充电桩筛选；
 2. 订单 A：用券预约（15 元券抵 10 元预付 5 元）→ 车牌识别入场（含陌生车牌识别失败工单）→ 信号差离线导航 →
    停放确认 → 充电 20kWh 离场 → 分成 27.3/3.9/7.8、补缴 24 元、流水借贷平衡；
 3. 订单 A2：同一充电位当晚第二单（第二位车主），时间轴正确解释两段使用分别由谁使用/付费；
@@ -160,16 +179,25 @@ cd backend && npm test
    **终裁后重算分账借贷仍平衡**、业主信用 -5；
 6. 订单 D：夜巡发现陌生车占用充电位 → 时间轴标注占用段（预约车主不计费/平台兜底/向陌生车主追缴）→
    判陌生车责任 → 服务费全免、平台垫付车主 20+业主 30、不影响预约车主信用；
-7. 共同追溯：全账户资金流水（含托管账户/券池）、调度总览、单订单全链路事件、六类证据档案、巡查照片留档。
+7. **订单 E（充电位错占申诉全链路）**：新能源车主提交现场照片+充电桩编号+到达时间+期望电量 →
+   系统自动调取燃油车道闸记录（识别无匹配/疑似跟车入场）并核验其**无有效预约** → 自动生成占充电位工单 →
+   物业三处置（联系挪车 App+LED 通知 / 安排替代充电桩 CP-E2-1 / 免除预约费）全部留痕 →
+   终裁陌生车主责任：违约记录罚金 200、信用 -10、押金不足全额挂账追缴 →
+   **欠款未缴时预约被冻结、补缴欠款后仍需补足 200 押金、补足后权限恢复** → 违约台账可按车牌检索并关联车主 →
+   离场实际充 10kWh：基础停车费 0（免除预约费）、**补电补偿按缺口 30kWh 赔付 54 元**、
+   平台先行赔付流水借贷平衡、不影响新能源车主信用、申诉档案回写实际充电量与补电金额；
+8. 共同追溯：全账户资金流水（含托管账户/券池）、调度总览、单订单全链路事件（含错占申诉/物业处置/违约登记/充电会话）、六类证据档案、巡查照片留档。
 
-最近一次执行输出：`RESULT: 53 passed, 0 failed` / `SMOKE_OK`。
+最近一次执行输出：`RESULT: 77 passed, 0 failed` / `SMOKE_OK`（连续两轮均通过）。
 
 ### 前端验证
-- `cd frontend && npm run build`：TypeScript 类型检查 + Vite 生产构建通过（40 个模块）；
-- Vite dev server 下登录、`/api` 代理到后端实测通过，全部页面模块经 dev server 转换返回 200。
+- `cd frontend && npm run build`：TypeScript 类型检查 + Vite 生产构建通过；
+- Vite dev server 下登录、`/api` 代理到后端实测通过（`POST /api/auth/login` 返回 201），
+  车主/物业/共享等全部页面模块经 dev server 转换返回 200。
 
 > 说明：本交付环境未安装 Docker daemon 与无头浏览器，因此 Docker 镜像构建与浏览器像素级截图未在本机执行；
 > Dockerfile/compose 已按多阶段构建标准编写，前端构建与后端编译均已在本机等价验证。
+> 本机另用临时 PostgreSQL 15 实例（127.0.0.1:5433，trust 认证）完成建表、种子与全部冒烟验证。
 
 ---
 
@@ -180,11 +208,12 @@ cd backend && npm test
 | 认证 | `POST /auth/login` `POST /auth/register` `GET /auth/me` | 全部 |
 | 车位 | `POST /spots` `GET /spots` `GET /spots/mine` `GET /spots/:id` `POST /spots/:id/review` `GET /spots/review/pending` | 业主/物业 |
 | 车辆·券 | `GET/POST /vehicles` `GET /coupons` `POST /coupons/issue` | 车主/管理员 |
-| 预约 | `POST /reservations` `GET /reservations` `GET /reservations/:id` `POST /reservations/:id/cancel` | 车主 |
+| 押金·违约 | `GET /deposit` `POST /deposit/topup` `GET /violations` | 车主/物业 |
+| 预约 | `POST /reservations` `GET /reservations` `GET /reservations/:id` `POST /reservations/:id/cancel` | 车主（预约时校验信用/押金/违约权限） |
 | 道闸·导航 | `POST /operations/gate/recognize` `POST /operations/gate/admit` `POST /operations/navigation/guidance` `POST /operations/reservations/:id/parked` `POST /operations/reservations/:id/report-signal` | 物业/车主 |
 | 巡查 | `GET/POST /operations/patrol` | 物业 |
 | 调度 | `GET /dispatch/incidents` `POST /dispatch/owner-return` `POST /dispatch/overstay` `POST /dispatch/incidents/:id/notify` `POST /dispatch/incidents/:id/resolve` `GET /dispatch/overview` | 业主/物业 |
-| 申诉 | `POST /appeals` `GET /appeals` `GET /appeals/:id` `POST /appeals/:id/evidence` `POST /appeals/:id/rule` `POST /appeals/:id/resettle` | 车主/物业 |
+| 申诉 | `POST /appeals`（`appeal_type=charging_occupy` 时附照片/桩编号/到达时间）`GET /appeals` `GET /appeals/:id` `POST /appeals/:id/evidence` **`POST /appeals/:id/handle`（物业接单：contact_move/alternative_charger/waive_fee）** `POST /appeals/:id/rule` `POST /appeals/:id/resettle` | 车主/物业 |
 | 分账 | `POST /reservations/:id/exit` `GET /reservations/:id/quote` `GET /reservations/:id/settlement` `GET /ledger` `GET /spots/:id/timeline` | 按角色 |
 
 支持道闸时钟校准参数 `entry_at` / `parked_at` / `exit_at` / `occurred_at` / `resolved_at` / `patrolled_at`
@@ -197,11 +226,12 @@ cd backend && npm test
 ├── docker-compose.yml          # 一键启动 db + backend + frontend
 ├── backend/
 │   ├── src/
-│   │   ├── domain/             # pricing 计费分账 / adjudication 证据裁决 / timeline 时间轴 / availability 时段
-│   │   ├── database/           # pg 连接池 + schema.sql（15 张表）
+│   │   ├── domain/             # pricing 计费分账 / adjudication 证据裁决 / timeline 时间轴
+│   │   │                       # recharge 补电补偿 / policy 预约权限与押金 / availability 时段
+│   │   ├── database/           # pg 连接池 + schema.sql（16 张表，含 violation_records、押金/补电字段）
 │   │   ├── auth/ spots/ reservations/ operations/ dispatch/ appeals/ settlement/
-│   ├── test/                   # 19 个 Jest 单元测试
-│   └── seed/seed.js + smoke.mjs  # 种子数据 + 53 项端到端冒烟
+│   ├── test/                   # 35 个 Jest 单元测试
+│   └── seed/seed.js + smoke.mjs  # 种子数据（6 账号）+ 77 项端到端冒烟
 └── frontend/
     └── src/
         ├── App.tsx             # 登录 + 四角色路由

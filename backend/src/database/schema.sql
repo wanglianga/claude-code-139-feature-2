@@ -142,6 +142,23 @@ CREATE TABLE IF NOT EXISTS appeals (
   spot_id BIGINT NOT NULL REFERENCES parking_spots(id),
   appellant_id BIGINT NOT NULL REFERENCES users(id),
   reason TEXT NOT NULL,
+  -- 申诉类型：普通错停 / 充电车位被燃油车错占
+  appeal_type TEXT NOT NULL DEFAULT 'wrong_parking'
+    CHECK (appeal_type IN ('wrong_parking','charging_occupy')),
+  -- 充电位错占专项证据：充电桩编号、到达时间、占用车辆车牌
+  charger_code TEXT,
+  arrived_at TIMESTAMPTZ,
+  occupying_plate TEXT,
+  -- 补电补偿：预约期望充电量 vs 实际充电量（未充满缺口）
+  requested_kwh NUMERIC(8,2),
+  actual_kwh NUMERIC(8,2),
+  recharge_compensation NUMERIC(10,2) NOT NULL DEFAULT 0,
+  -- 物业安排的替代充电桩编号
+  alt_charger_code TEXT,
+  -- 物业接单处置动作：contact_move / alternative_charger / waive_fee
+  property_actions JSONB NOT NULL DEFAULT '[]'::jsonb,
+  handled_by BIGINT REFERENCES users(id),
+  handled_at TIMESTAMPTZ,
   status TEXT NOT NULL DEFAULT 'open'
     CHECK (status IN ('open','investigating','upheld','rejected','closed')),
   ruling TEXT CHECK (ruling IN (
@@ -235,5 +252,56 @@ CREATE TABLE IF NOT EXISTS patrol_logs (
   patrolled_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- 违约记录：燃油车占用充电位且无有效预约等，影响后续预约权限与押金规则
+CREATE TABLE IF NOT EXISTS violation_records (
+  id BIGSERIAL PRIMARY KEY,
+  code TEXT UNIQUE NOT NULL,
+  type TEXT NOT NULL CHECK (type IN (
+    'ice_occupy_charger','stranger_occupy','wrong_parking','overstay','other'
+  )),
+  plate TEXT NOT NULL,
+  -- 若系统可识别到车主账号则落账，否则挂账追缴
+  user_id BIGINT REFERENCES users(id),
+  spot_id BIGINT REFERENCES parking_spots(id),
+  appeal_id BIGINT REFERENCES appeals(id),
+  reservation_id BIGINT REFERENCES reservations(id),
+  description TEXT,
+  -- 违约时是否存在有效预约（无有效预约是影响权限/押金的关键条件）
+  has_valid_reservation BOOLEAN NOT NULL DEFAULT false,
+  fine NUMERIC(10,2) NOT NULL DEFAULT 0,           -- 违约金
+  deposit_deducted NUMERIC(10,2) NOT NULL DEFAULT 0, -- 已从押金扣除金额
+  amount_outstanding NUMERIC(10,2) NOT NULL DEFAULT 0, -- 挂账追缴余额
+  credit_delta INT NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'open'
+    CHECK (status IN ('open','recorded','deducted','collected','waived')),
+  evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_by BIGINT REFERENCES users(id),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  resolved_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_violations_plate ON violation_records(plate);
+CREATE INDEX IF NOT EXISTS idx_violations_user ON violation_records(user_id);
+
 -- 幂等迁移：为旧版本库补充后续新增列
 ALTER TABLE settlements ADD COLUMN IF NOT EXISTS coupon_compensation NUMERIC(10,2) NOT NULL DEFAULT 0;
+
+-- 充电位错占补电补偿（未充满电量缺口的现金补偿，平台先行赔付后向违约车主追缴）
+ALTER TABLE settlements ADD COLUMN IF NOT EXISTS recharge_compensation NUMERIC(10,2) NOT NULL DEFAULT 0;
+ALTER TABLE settlements ADD COLUMN IF NOT EXISTS recharge_kwh_gap NUMERIC(8,2) NOT NULL DEFAULT 0;
+
+-- 用户押金规则：押金余额 + 欠款挂账（违约扣押金/追缴）
+ALTER TABLE users ADD COLUMN IF NOT EXISTS deposit_balance NUMERIC(10,2) NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS outstanding_amount NUMERIC(10,2) NOT NULL DEFAULT 0;
+
+-- 申诉专项字段（旧库补列）
+ALTER TABLE appeals ADD COLUMN IF NOT EXISTS appeal_type TEXT NOT NULL DEFAULT 'wrong_parking';
+ALTER TABLE appeals ADD COLUMN IF NOT EXISTS charger_code TEXT;
+ALTER TABLE appeals ADD COLUMN IF NOT EXISTS arrived_at TIMESTAMPTZ;
+ALTER TABLE appeals ADD COLUMN IF NOT EXISTS occupying_plate TEXT;
+ALTER TABLE appeals ADD COLUMN IF NOT EXISTS requested_kwh NUMERIC(8,2);
+ALTER TABLE appeals ADD COLUMN IF NOT EXISTS actual_kwh NUMERIC(8,2);
+ALTER TABLE appeals ADD COLUMN IF NOT EXISTS recharge_compensation NUMERIC(10,2) NOT NULL DEFAULT 0;
+ALTER TABLE appeals ADD COLUMN IF NOT EXISTS alt_charger_code TEXT;
+ALTER TABLE appeals ADD COLUMN IF NOT EXISTS property_actions JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE appeals ADD COLUMN IF NOT EXISTS handled_by BIGINT REFERENCES users(id);
+ALTER TABLE appeals ADD COLUMN IF NOT EXISTS handled_at TIMESTAMPTZ;

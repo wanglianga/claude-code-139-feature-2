@@ -139,4 +139,40 @@ describe('settlePrice', () => {
       expect(Math.abs(debit - credit)).toBeLessThanOrEqual(0.05);
     }
   });
+
+  test('充电位被燃油车错占：补电补偿平台先行赔付且流水借贷平衡', () => {
+    const r = settlePrice({
+      ...baseInput,
+      chargeKwh: 0,
+      ruling: 'stranger',
+      incidents: [{ type: 'ice_occupy_charger' }],
+      rechargeCompensation: 54,
+      rechargeKwhGap: 30,
+      prepaid: 15,
+    });
+    expect(r.rechargeCompensation).toBe(54);
+    expect(r.rechargeKwhGap).toBe(30);
+    expect(r.ledger.some((l) => l.account === 'driver' && l.memo.includes('补电补偿'))).toBe(true);
+    expect(r.ledger.some((l) => l.account === 'platform' && l.memo.includes('补电补偿'))).toBe(true);
+    const debit = r.ledger.filter((l) => l.direction === 'debit').reduce((a, b) => a + b.amount, 0);
+    const credit = r.ledger.filter((l) => l.direction === 'credit').reduce((a, b) => a + b.amount, 0);
+    expect(Math.abs(debit - credit)).toBeLessThanOrEqual(0.05);
+  });
+
+  test('物业免除预约费：基础停车费为 0、预付退还，补电补偿仍发放', () => {
+    const r = settlePrice({
+      ...baseInput,
+      chargeKwh: 0,
+      waiveReservationFee: true,
+      rechargeCompensation: 54,
+      rechargeKwhGap: 30,
+      prepaid: 15,
+    });
+    expect(r.baseFee).toBe(0);
+    expect(r.refund).toBe(15);
+    expect(r.rechargeCompensation).toBe(54);
+    const debit = r.ledger.filter((l) => l.direction === 'debit').reduce((a, b) => a + b.amount, 0);
+    const credit = r.ledger.filter((l) => l.direction === 'credit').reduce((a, b) => a + b.amount, 0);
+    expect(Math.abs(debit - credit)).toBeLessThanOrEqual(0.05);
+  });
 });

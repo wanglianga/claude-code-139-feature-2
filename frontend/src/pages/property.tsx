@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { api } from '../api';
 import { useLoader } from '../hooks';
 import { WorkspaceShell } from '../App';
-import { dt, INCIDENT_LABEL, Tag } from '../ui';
+import { dt, INCIDENT_LABEL, money, Tag } from '../ui';
 import { OrderTable } from './owner';
 import { AppealDetailModal, ReservationDetailModal } from './shared';
 
@@ -13,7 +13,8 @@ const NAV = [
   { key: 'dispatch', label: '夜间调度看板', icon: '🌙' },
   { key: 'patrol', label: '巡查登记', icon: '🔦' },
   { key: 'appeals', label: '申诉裁决', icon: '⚖️' },
-  { key: 'orders', label: '订单追溯', icon: '🧾' },
+  { key: 'violations', label: '违约追缴', icon: '🧾' },
+  { key: 'orders', label: '订单追溯', icon: '🚗' },
 ];
 
 export function PropertyWorkspace({ session }: { session: Session }) {
@@ -25,6 +26,7 @@ export function PropertyWorkspace({ session }: { session: Session }) {
       {tab === 'dispatch' && <DispatchTab />}
       {tab === 'patrol' && <PatrolTab />}
       {tab === 'appeals' && <AppealsTab />}
+      {tab === 'violations' && <ViolationsTab />}
       {tab === 'orders' && <OrdersTab />}
     </WorkspaceShell>
   );
@@ -390,7 +392,7 @@ function AppealsTab() {
             <tbody>
               {list.map((a) => (
                 <tr key={a.id}>
-                  <td className="mono small">{a.code}<div className="small muted">{dt(a.created_at)}</div></td>
+                  <td className="mono small">{a.code}{a.appeal_type === 'charging_occupy' && <Tag cls="purple" label="⚡充电位" />}<div className="small muted">{dt(a.created_at)}</div></td>
                   <td>{a.appellant_name}</td>
                   <td>{a.spot_code}<div className="small muted mono">{a.reservation_code} · {a.plate}</div></td>
                   <td className="small" style={{ maxWidth: 280 }}>{a.reason}</td>
@@ -403,6 +405,66 @@ function AppealsTab() {
         </div>
       </div>
       {open && <AppealDetailModal id={open} onClose={() => setOpen(null)} onChanged={reload} />}
+    </div>
+  );
+}
+
+// ---------- 违约追缴（燃油车占充电位等）----------
+function ViolationsTab() {
+  const [plate, setPlate] = useState('');
+  const query = plate ? `?plate=${encodeURIComponent(plate)}` : '';
+  const { data: list, reload } = useLoader<any[]>(`/violations${query}`);
+
+  const stats = (list ?? []).reduce(
+    (acc, v) => {
+      acc.fine += Number(v.fine);
+      acc.deducted += Number(v.deposit_deducted);
+      acc.outstanding += Number(v.amount_outstanding);
+      return acc;
+    },
+    { fine: 0, deducted: 0, outstanding: 0 },
+  );
+
+  return (
+    <div>
+      <PageHead title="占位违约追缴" desc="燃油车占用充电位且无有效预约的违约记录：信用 -10、违约金 ¥200 优先扣押金、不足挂账追缴，并影响后续预约权限与押金门槛" />
+      <div className="grid grid-3" style={{ marginBottom: 16 }}>
+        <div className="stat"><div className="label">违约罚金合计</div><div className="value">{money(stats.fine)}</div><div className="sub">{list?.length ?? 0} 条记录</div></div>
+        <div className="stat"><div className="label">已从押金扣除</div><div className="value text-green" style={{ color: 'var(--green)' }}>{money(stats.deducted)}</div><div className="sub">已追缴入账</div></div>
+        <div className="stat"><div className="label">挂账追缴余额</div><div className="value" style={{ color: stats.outstanding > 0 ? 'var(--red)' : undefined }}>{money(stats.outstanding)}</div><div className="sub">车主补缴/押金补足后结清</div></div>
+      </div>
+      <div className="card">
+        <div className="filter-bar">
+          <h3 style={{ margin: 0 }}>违约记录</h3>
+          <span style={{ flex: 1 }} />
+          <input className="mono" style={{ width: 180 }} placeholder="按车牌检索" value={plate} onChange={(e) => setPlate(e.target.value.toUpperCase())} />
+          <button className="btn sm ghost" onClick={reload}>刷新</button>
+        </div>
+        {(list ?? []).length === 0 && <div className="empty">暂无违约记录</div>}
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>单号</th><th>类型</th><th>车牌</th><th>车主账号</th><th>车位</th><th>有效预约</th><th>罚金</th><th>押金抵扣</th><th>挂账</th><th>信用</th><th>状态</th><th>时间</th></tr></thead>
+            <tbody>
+              {(list ?? []).map((v) => (
+                <tr key={v.id}>
+                  <td className="mono small">{v.code}</td>
+                  <td>{v.type === 'ice_occupy_charger' ? '燃油车占充电位' : v.type}</td>
+                  <td className="mono">{v.plate}</td>
+                  <td>{v.user_name ? `#${v.user_id} ${v.user_name}` : <span className="small muted">无账号·挂账</span>}</td>
+                  <td className="mono small">{v.spot_code ?? '—'}</td>
+                  <td>{v.has_valid_reservation ? <Tag cls="gray" label="有" /> : <Tag cls="red" label="无" />}</td>
+                  <td className="money">{money(v.fine)}</td>
+                  <td className="money">{money(v.deposit_deducted)}</td>
+                  <td className="money">{money(v.amount_outstanding)}</td>
+                  <td>{v.credit_delta}</td>
+                  <td><Tag status={v.status === 'waived' ? 'closed' : v.status === 'collected' ? 'resolved' : v.status === 'deducted' ? 'resolved' : 'open'} /></td>
+                  <td className="small muted">{dt(v.created_at)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
   );
 }

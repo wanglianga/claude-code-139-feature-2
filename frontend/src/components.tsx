@@ -11,6 +11,7 @@ export function SettlementView({ s }: { s: any }) {
     ['优惠券抵扣', s.coupon_discount],
     ['异常补偿（现金+赔付券）', s.abnormal_compensation],
     ['其中赔付券（非现金）', s.coupon_compensation],
+    ['补电补偿（未充满缺口' + (Number(s.recharge_kwh_gap) || 0) + 'kWh）', s.recharge_compensation],
     ['业主补偿', s.owner_compensation],
     ['预约预付', s.prepaid],
   ];
@@ -278,6 +279,9 @@ const EVENT_LABEL: Record<string, string> = {
   incident_resolved: '异常工单处置',
   appeal_submitted: '发起错停申诉',
   appeal_ruled: '申诉终裁',
+  charging_occupy_report: '充电位错占申诉',
+  charging_dispute_handled: '物业接单处置',
+  violation_recorded: '占位违约登记',
   settlement_completed: '离场结算完成',
   settlement_recomputed: '分账重算',
   credit_adjusted: '信用调整',

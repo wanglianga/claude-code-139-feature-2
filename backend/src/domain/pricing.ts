@@ -63,6 +63,11 @@ export interface PriceInput {
   ruling?: Ruling | null;
   couponAmount?: number;
   prepaid: number;
+  // 物业处置"免除预约费"：基础停车费全免并退还预付
+  waiveReservationFee?: boolean;
+  // 充电位被燃油车错占导致未充满的补电补偿（平台先行赔付，后向违约车主追缴）
+  rechargeCompensation?: number;
+  rechargeKwhGap?: number;
 }
 
 export interface LedgerDraft {
@@ -85,6 +90,8 @@ export interface SettlementBreakdown {
   abnormalCompensation: number; // 车主收到的补偿总额（现金 + 赔付券）
   couponCompensation: number; // 赔付券（非现金，下次抵扣）
   ownerCompensation: number; // 业主收到的补偿（车主错停等）
+  rechargeCompensation: number; // 充电位被占导致未充满的补电补偿（现金，平台垫付追缴）
+  rechargeKwhGap: number; // 未充满电量缺口
   prepaid: number;
   refund: number;
   exitCharge: number;
@@ -125,7 +132,9 @@ export function settlePrice(input: PriceInput): SettlementBreakdown {
   // 服务未实际交付（平台/物业/陌生车责任）时免收停车费；业主违约时按实际可用时长照实计费
   const feeWaived = ['platform_fault', 'property_fault', 'stranger'].includes(ruling ?? '');
   let baseFee = 0;
-  if (ruling === 'no_fault' || !feeWaived) {
+  if (input.waiveReservationFee) {
+    notes.push('物业处置免除本次预约（停车）费用，预付随退款返还车主');
+  } else if (ruling === 'no_fault' || !feeWaived) {
     const hours = durationMinutes / 60;
     baseFee = round2(hours * input.hourlyRate);
     if (input.overnightCap && baseFee > input.overnightCap) {
@@ -199,6 +208,16 @@ export function settlePrice(input: PriceInput): SettlementBreakdown {
   }
   const abnormalCompensation = round2(cashCompensation + couponCompensation);
 
+  // ---- 补电补偿（充电位被燃油车错占导致未充满）----
+  // 现金赔付，独立于异常补偿科目；平台先行垫付、随后向占位违约车主追缴（不占用业主分成）
+  const rechargeKwhGap = round2(Math.max(0, input.rechargeKwhGap ?? 0));
+  const rechargeCash = round2(Math.max(0, input.rechargeCompensation ?? 0));
+  if (rechargeCash > 0) {
+    notes.push(
+      `新能源车因充电位被占未充满（缺口 ${rechargeKwhGap}kWh），平台先行赔付补电补偿 ¥${rechargeCash}，向占位车主追缴`,
+    );
+  }
+
   // ---- 优惠券 ----
   const couponDiscount = Math.min(input.couponAmount ?? 0, round2(baseFee + chargingFee + overtimeFee));
   if (couponDiscount > 0) notes.push(`优惠券抵扣 ¥${couponDiscount}`);
@@ -226,6 +245,7 @@ export function settlePrice(input: PriceInput): SettlementBreakdown {
 
   // ---- 退款与离场补缴 ----
   // 车主净头寸 D = 账单 - 已用券 - 现金补偿（赔付券不冲抵本单，下次使用）；为正净支付，为负净收款
+  // 补电补偿由平台绕过托管直接先行赔付（见下方流水），不计入托管退款
   const prepaid = round2(input.prepaid);
   const driverNet = round2(gross - couponDiscount - cashCompensation); // 可负
   let refund = driverNet < prepaid ? round2(prepaid - driverNet) : 0;
@@ -349,6 +369,11 @@ export function settlePrice(input: PriceInput): SettlementBreakdown {
     ledger.push({ account: 'platform', direction: 'debit', amount: strangerAdvance, memo: '平台先行赔付业主（向陌生车主追缴）' });
     ledger.push({ account: 'owner', direction: 'credit', amount: strangerAdvance, memo: '业主补偿（陌生车占用，平台垫付）' });
   }
+  // 8) 补电补偿：平台绕过托管先行赔付新能源车主，结案后向占位违约车主追缴
+  if (rechargeCash > 0) {
+    ledger.push({ account: 'platform', direction: 'debit', amount: rechargeCash, memo: `平台先行赔付补电补偿（缺口 ${rechargeKwhGap}kWh，向占位车主追缴）` });
+    ledger.push({ account: 'driver', direction: 'credit', amount: rechargeCash, memo: `补电补偿（未充满 ${rechargeKwhGap}kWh，平台垫付）` });
+  }
 
   ownerIncome = ownerTotal;
 
@@ -367,6 +392,8 @@ export function settlePrice(input: PriceInput): SettlementBreakdown {
     abnormalCompensation,
     couponCompensation,
     ownerCompensation,
+    rechargeCompensation: rechargeCash,
+    rechargeKwhGap,
     prepaid,
     refund,
     exitCharge,

@@ -91,4 +91,23 @@ describe('adjudicateAppeal', () => {
     expect(r.evidenceTimeline[0].source).toBe('gate_log');
     expect(r.evidenceTimeline[1].source).toBe('signal');
   });
+
+  test('充电位被燃油车占用：系统入场记录+工单 → 陌生占位车主责任', () => {
+    const r = adjudicateAppeal({
+      ...base,
+      actualPlate: '沪A12345',
+      evidence: [
+        {
+          source: 'gate_log',
+          title: '占用车辆道闸入场记录（系统自动调取）',
+          content: '道闸入场记录：燃油车 沪A12345 识别放行入场；核对预约系统：该车无有效预约',
+          capturedAt: new Date('2026-10-01T18:50:00Z'),
+          stance: 'support',
+        },
+      ],
+      incidents: [{ type: 'ice_occupy_charger', started_at: new Date('2026-10-01T19:00:00Z') }],
+    });
+    expect(r.ruling).toBe('stranger');
+    expect(r.reasons.some((x) => x.includes('燃油车'))).toBe(true);
+  });
 });

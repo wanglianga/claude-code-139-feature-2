@@ -61,9 +61,17 @@ async function main() {
   const owner = await login('owner1');
   const driver1 = await login('driver1');
   const driver2 = await login('driver2');
+  const driver3 = await login('driver3');
   const prop = await login('property1');
   const admin = await login('admin1');
-  check('四类角色登录成功', !!(owner.token && driver1.token && driver2.token && prop.token && admin.token));
+  // 燃油车车主：每轮动态注册独立账号，保证冒烟可重复执行（不累积押金/欠款）
+  const iceUsername = `ice${RUN}`;
+  const iceName = `冒烟燃油${RUN}`;
+  const iceReg = await api('POST', '/auth/register', null, {
+    username: iceUsername, password: 'Pass1234', name: iceName, role: 'driver', phone: '13900090001',
+  });
+  const iceOwner = { token: iceReg.accessToken, user: iceReg.user };
+  check('五类角色登录成功 + 动态注册燃油车车主', !!(owner.token && driver1.token && driver2.token && driver3.token && prop.token && admin.token && iceOwner.token));
 
   // 为可重复执行，给 driver1 新发一张 10 元夜间券
   await api('POST', '/coupons/issue', admin.token, { user_id: driver1.user.id, amount: 10, code: `NIGHT${RUN}` });
@@ -78,7 +86,7 @@ async function main() {
   });
 
   const windows = [0, 1, 2, 3, 4, 5, 6].map((weekday) => ({ weekday, start_time: '00:00', end_time: '23:59' }));
-  const codes = { A: `E${RUN}1`, B: `E${RUN}2`, C: `E${RUN}3`, D: `E${RUN}4` };
+  const codes = { A: `E${RUN}1`, B: `E${RUN}2`, C: `E${RUN}3`, D: `E${RUN}4`, E: `E${RUN}5` };
   async function publish(code, opts = {}) {
     return api('POST', '/spots', owner.token, {
       community_id: 1,
@@ -93,14 +101,15 @@ async function main() {
       windows,
     });
   }
-  const [spotA, spotB, spotC, spotD] = await Promise.all([
+  const [spotA, spotB, spotC, spotD, spotE] = await Promise.all([
     publish(codes.A, { charger: true, monthly: true }),
     publish(codes.B),
     publish(codes.C),
     publish(codes.D, { charger: true }),
+    publish(codes.E, { charger: true }),
   ]);
-  check('业主发布 4 个车位，初始待审核', spotA.review_status === 'pending');
-  for (const s of [spotA, spotB, spotC, spotD]) {
+  check('业主发布 5 个车位，初始待审核', spotA.review_status === 'pending');
+  for (const s of [spotA, spotB, spotC, spotD, spotE]) {
     await api('POST', `/spots/${s.id}/review`, prop.token, { pass: true, remark: '产权材料齐全' });
   }
   const approved = await api('GET', `/spots/${spotA.id}`, prop.token);
@@ -351,7 +360,120 @@ async function main() {
   check('D 流水含平台先行赔付（追缴）记录', stD.ledger.some((l) => l.memo.includes('先行赔付')));
   check('D 流水借贷平衡', ledgerBalanced(stD.ledger));
 
-  console.log('== 7. 共同追溯：分账流水、调度总览、单订单全链路事件、巡查档案 ==');
+  console.log('== 7. 订单 E：新能源充电位被燃油车错占 → 入场记录调取 → 物业三处置 → 违约/押金/权限 → 补电补偿 ==');
+  const reserveE = await api('POST', '/reservations', driver1.token, {
+    spot_id: spotE.id,
+    vehicle_id: neCar.id,
+    start_at: at(0),
+    end_at: at(240),
+  });
+  await api('POST', '/operations/gate/admit', prop.token, {
+    reservation_id: reserveE.id,
+    plate: neCar.plate,
+    gate: '南门入口',
+    mode: 'auto',
+    entry_at: at(0),
+  });
+  // 燃油车（driver3）无预约，道闸识别无匹配（疑似跟车入场），系统留存影像记录
+  const icePlate = `沪G${RUN.slice(0, 5)}`;
+  await api('POST', '/vehicles', iceOwner.token, { plate: icePlate, plate_color: '蓝牌', is_new_energy: false });
+  const iceRec = await api('POST', '/operations/gate/recognize', prop.token, {
+    plate: icePlate,
+    gate: '地库 B2 入口',
+    confidence: 0.4,
+  });
+  check('燃油车无预约识别失败并留存记录（疑似跟车入场）', iceRec.admitted === false && !!iceRec.ticket_id);
+
+  // 新能源车主提交充电位错占申诉：照片 + 桩编号 + 到达时间
+  const appealE = await api('POST', '/appeals', driver1.token, {
+    reservation_id: reserveE.id,
+    reason: '到场发现预约充电位被燃油车占用，无法充电',
+    appeal_type: 'charging_occupy',
+    charger_code: 'CP-E-3',
+    arrived_at: at(5),
+    occupying_plate: icePlate,
+    requested_kwh: 40,
+    photos: [
+      { media_url: `evidence/ice-${RUN}.jpg`, note: '照片显示燃油车停在充电位，充电枪无法使用', captured_at: at(5) },
+    ],
+  });
+  check('充电位错占申诉受理且自动建议陌生占位车主责任', appealE.appeal.appeal_type === 'charging_occupy' && appealE.adjudication.ruling === 'stranger', appealE.adjudication);
+  check('系统自动调取到燃油车道闸记录（识别无匹配/疑似跟车）', !!appealE.occupying_entry.entry && appealE.occupying_entry.entry.type === 'recognition_fail', appealE.occupying_entry);
+  check('系统核验燃油车在该时段无有效预约', !appealE.occupying_entry.validReservation);
+  check('补电补偿预览：缺口 40kWh（实际 0）→ 40×1.2×1.5=72 元', appealE.recharge_preview.kwhGap === 40 && Number(appealE.recharge_preview.compensation) === 72, appealE.recharge_preview);
+
+  const iceTickets = await api('GET', '/dispatch/incidents?status=open', prop.token);
+  const iceTicket = iceTickets.find((t) => t.type === 'ice_occupy_charger' && t.reservation_id === reserveE.id);
+  check('申诉自动生成"燃油车占充电位"工单进入物业调度看板', !!iceTicket, iceTickets.map((t) => t.type));
+
+  const appealDetail1 = await api('GET', `/appeals/${appealE.appeal.id}`, prop.token);
+  check('证据链含现场照片与系统调取的入场记录', appealDetail1.evidence.some((e) => e.source === 'photo') && appealDetail1.evidence.some((e) => e.source === 'gate_log' && e.content.includes('无有效预约')));
+
+  // 物业接单：三种处置动作
+  await api('POST', `/appeals/${appealE.appeal.id}/handle`, prop.token, { action: 'contact_move', note: '电话联系车主，App+LED 通知挪车' });
+  const iceNotices = await api('GET', `/dispatch/incidents/${iceTicket.id}/notices`, prop.token);
+  check('联系挪车：通知送达燃油车（App 推送+LED）', iceNotices.some((n) => n.target_plate === icePlate && n.delivered_at));
+  await api('POST', `/appeals/${appealE.appeal.id}/handle`, prop.token, { action: 'alternative_charger', alt_charger_code: 'CP-E2-1', note: '引导至相邻空闲充电位' });
+  await api('POST', `/appeals/${appealE.appeal.id}/handle`, prop.token, { action: 'waive_fee', note: '本次预约费免除' });
+  const appealDetail2 = await api('GET', `/appeals/${appealE.appeal.id}/handle`.replace('/handle', ''), prop.token);
+  check('三种物业处置动作全部留痕并记录替代桩编号', appealDetail2.property_actions.length === 3 && appealDetail2.alt_charger_code === 'CP-E2-1', appealDetail2.property_actions);
+
+  // 终裁占位燃油车责任 → 违约记录（无有效预约）
+  const ruleE = await api('POST', `/appeals/${appealE.appeal.id}/rule`, prop.token, {
+    ruling: 'stranger',
+    note: '入场记录+现场照片确认燃油车占充电位且无有效预约',
+  });
+  check('终裁生成违约记录：罚金 200、信用 -10、押金 0 时全额挂账追缴',
+    !!ruleE.violation && Number(ruleE.violation.fine) === 200 && ruleE.violation.credit_delta === -10 &&
+      Number(ruleE.violation.amount_outstanding) === 200 && Number(ruleE.violation.deposit_deducted) === 0 &&
+      ruleE.violation.has_valid_reservation === false,
+    ruleE.violation);
+  const me3 = await api('GET', '/auth/me', iceOwner.token);
+  check('燃油车车主信用 -10 落库（100→90）', me3.credit_score === iceOwner.user.creditScore - 10, `${iceOwner.user.creditScore}->${me3.credit_score}`);
+
+  // 违约影响后续预约权限：欠款未缴直接封禁
+  const depositBlocked = await api('GET', '/deposit', iceOwner.token);
+  check('未结清欠款时预约权限被冻结', depositBlocked.access.allowed === false && depositBlocked.access.reasons.some((x) => x.includes('未结清')));
+  const reserveBlocked = await api('POST', '/reservations', iceOwner.token, {
+    spot_id: spotB.id, vehicle_id: (await api('GET', '/vehicles', iceOwner.token)).find((v) => v.plate === icePlate).id,
+    start_at: at(300), end_at: at(360),
+  }).catch((e) => e.message);
+  check('燃油车车主在欠款状态下预约被接口拒绝', typeof reserveBlocked === 'string' && reserveBlocked.includes('未结清'));
+
+  // 补缴 200 欠款后仍需补足 200 押金（占位违约史提高门槛）
+  const pay1 = await api('POST', '/deposit/topup', iceOwner.token, { amount: 200 });
+  check('补缴 200：欠款结清、押金未入账', Number(pay1.paid_debt) === 200 && Number(pay1.deposit_added) === 0);
+  const depositMid = await api('GET', '/deposit', iceOwner.token);
+  check('欠款结清但押金不足 200，仍不可预约', depositMid.access.allowed === false && depositMid.access.requiredDeposit === 200 && depositMid.access.shortfall === 200);
+  await api('POST', '/deposit/topup', iceOwner.token, { amount: 200 });
+  const depositOk = await api('GET', '/deposit', iceOwner.token);
+  check('补足 200 押金后预约权限恢复', depositOk.access.allowed === true && Number(depositOk.deposit_balance) === 200);
+
+  // 物业/管理员可查违约追缴台账（含已落账车主）
+  const violations = await api('GET', `/violations?plate=${encodeURIComponent(icePlate)}`, prop.token);
+  const v0 = violations.find((v) => v.appeal_id === appealE.appeal.id);
+  check('违约追缴台账可按车牌检索并关联车主账号',
+    !!v0 && Number(v0.user_id) === Number(iceOwner.user.id) && v0.user_name === iceName && v0.status === 'collected',
+    violations);
+
+  // 新能源车主离场：实际只充 10kWh（替代桩），按缺口 30kWh 结算补电补偿，且物业免除预约费
+  const stE = await api('POST', `/reservations/${reserveE.id}/exit`, driver1.token, { charge_kwh: 10, exit_at: at(240) });
+  check('E 物业免除预约费：基础停车费 0', Number(stE.base_fee) === 0, stE);
+  check('E 补电补偿：缺口 30kWh → 54 元（40×1.2×1.5=54）', Number(stE.recharge_kwh_gap) === 30 && Number(stE.recharge_compensation) === 54, stE);
+  check('E 补电补偿流水：平台先行赔付车主（含追缴摘要）', stE.ledger.some((l) => l.account === 'platform' && l.direction === 'debit' && l.memo.includes('补电补偿')) && stE.ledger.some((l) => l.account === 'driver' && Number(l.amount) === 54));
+  check('E 不影响新能源预约车主信用', stE.credit_delta === 0 || stE.credit_target === 'none');
+  check('E 资金流水借贷平衡', ledgerBalanced(stE.ledger));
+  const appealDetail3 = await api('GET', `/appeals/${appealE.appeal.id}`, driver1.token);
+  check('E 申诉档案回写实际充电量与补电补偿', Number(appealDetail3.actual_kwh) === 10 && Number(appealDetail3.recharge_compensation) === 54);
+  const detailE = await api('GET', `/reservations/${reserveE.id}`, driver1.token);
+  check('E 全链路事件含错占申诉/物业处置/违约登记/充电会话',
+    ['charging_occupy_report', 'charging_dispute_handled', 'violation_recorded', 'charging_session'].every(
+      (t) => detailE.events.some((e) => e.type === t),
+    ),
+    detailE.events.map((e) => e.type),
+  );
+
+  console.log('== 8. 共同追溯：分账流水、调度总览、单订单全链路事件、巡查档案 ==');
   const ledger = await api('GET', '/ledger', prop.token);
   check(
     '分账流水覆盖车主/业主/物业/平台/券池/托管账户',
