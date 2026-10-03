@@ -92,6 +92,7 @@ function GateTab() {
   const [rec, setRec] = useState<any>(null);
   const [err, setErr] = useState('');
   const [confidence, setConfidence] = useState(0.96);
+  const [extMsg, setExtMsg] = useState('');
 
   const recognize = async () => {
     setErr('');
@@ -114,8 +115,10 @@ function GateTab() {
 
   return (
     <div>
-      <PageHead title="道闸操作台" desc="摄像头车牌识别 → 匹配当晚预约 → 自动放行并下发导航；识别失败时转人工核验放行，全过程写入同一笔停车服务" />
-      <div className="grid grid-2">
+      <PageHead title="道闸操作台" desc="摄像头车牌识别 → 匹配当晚预约 → 自动放行并下发导航；识别失败时转人工核验放行；外来车辆登记形成入场台账（充电位错占申诉据此调取）" />
+      <ExternalAccessLog onMsg={setExtMsg} />
+      {extMsg && <div className="alert ok" style={{ marginTop: 12 }}>{extMsg}</div>}
+      <div className="grid grid-2" style={{ marginTop: 16 }}>
         <div className="card">
           <h3>入场识别</h3>
           {err && <div className="alert error">{err}</div>}
@@ -169,6 +172,64 @@ function GateTab() {
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+// ---------- 外来车辆入场登记（无预约燃油车等，形成 gate_access_logs 台账）----------
+function ExternalAccessLog({ onMsg }: { onMsg: (s: string) => void }) {
+  const { data: spots } = useLoader<any[]>('/spots');
+  const [spotId, setSpotId] = useState<number | ''>('');
+  const [plate, setPlate] = useState('');
+  const [isNE, setIsNE] = useState(false);
+  const [gate, setGate] = useState('地库 B2 入口');
+  const [err, setErr] = useState('');
+
+  const submit = async () => {
+    setErr('');
+    if (!plate) { setErr('请填写车牌'); return; }
+    try {
+      await api('POST', '/operations/gate/access-log', {
+        spot_id: spotId || undefined,
+        plate,
+        is_new_energy: isNE,
+        gate,
+      });
+      onMsg(`已登记 ${isNE ? '新能源' : '燃油'}车 ${plate} 入场（${gate}），将进入错占申诉入场记录检索范围`);
+      setPlate(''); setIsNE(false);
+    } catch (e: any) { setErr(e.message); }
+  };
+
+  return (
+    <div className="card">
+      <h3>外来车辆入场登记 <span className="hint">无平台预约车辆（充电位错占申诉将调取该入场记录）</span></h3>
+      {err && <div className="alert error">{err}</div>}
+      <div className="form-row">
+        <div className="field" style={{ maxWidth: 220 }}>
+          <label>车牌</label>
+          <input className="mono" value={plate} onChange={(e) => setPlate(e.target.value.toUpperCase())} placeholder="如 沪A98765" />
+        </div>
+        <div className="field" style={{ maxWidth: 220 }}>
+          <label>驶入车位（可选）</label>
+          <select value={spotId} onChange={(e) => setSpotId(e.target.value ? Number(e.target.value) : '')}>
+            <option value="">未绑定车位</option>
+            {(spots ?? []).map((s: any) => <option key={s.id} value={s.id}>{s.code}（{s.location_desc}）</option>)}
+          </select>
+        </div>
+        <div className="field" style={{ maxWidth: 180 }}>
+          <label>道闸</label>
+          <select value={gate} onChange={(e) => setGate(e.target.value)}>
+            <option>地库 B2 入口</option><option>南门入口</option><option>北门入口</option>
+          </select>
+        </div>
+        <div className="field" style={{ maxWidth: 150 }}>
+          <label>车辆类型</label>
+          <label className="checkbox" style={{ marginTop: 6 }}>
+            <input type="checkbox" checked={isNE} onChange={(e) => setIsNE(e.target.checked)} /> 新能源（不勾=燃油车）
+          </label>
+        </div>
+      </div>
+      <button className="btn sm" onClick={submit}>登记入场</button>
     </div>
   );
 }

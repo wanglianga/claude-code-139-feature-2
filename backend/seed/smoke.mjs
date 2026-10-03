@@ -351,7 +351,166 @@ async function main() {
   check('D 流水含平台先行赔付（追缴）记录', stD.ledger.some((l) => l.memo.includes('先行赔付')));
   check('D 流水借贷平衡', ledgerBalanced(stD.ledger));
 
-  console.log('== 7. 共同追溯：分账流水、调度总览、单订单全链路事件、巡查档案 ==');
+  console.log('== 7. 订单 E：新能源预约充电位被燃油车错占 → 申诉(照片/桩号/到达时间) → 自动调取入场记录 → 物业处置 → 违约押金/权限 → 未充满补电补偿 ==');
+  codes.E = `E${RUN}5`;
+  const spotE = await publish(codes.E, { charger: true });
+  await api('POST', `/spots/${spotE.id}/review`, prop.token, { pass: true, remark: '产权材料齐全（充电位）' });
+
+  // 燃油车车主：注册账号 + 燃油车辆 + 押金 30 元（不足额，制造挂账追缴）
+  const iceName = `ice${RUN}`;
+  const iceReg = await api('POST', '/auth/register', null, { username: iceName, password: 'Pass1234', name: '燃油车老周', role: 'driver' });
+  const iceToken = iceReg.accessToken;
+  const icePlate = `沪C${RUN.slice(0, 5)}`;
+  await api('POST', '/vehicles', iceToken, { plate: icePlate, plate_color: '蓝牌', is_new_energy: false });
+  await api('POST', '/wallet/deposit/topup', iceToken, { amount: 30 });
+
+  // 燃油车无预约进入小区，道闸/物业人工登记入场台账（早于新能源车主到达）
+  await api('POST', '/operations/gate/access-log', prop.token, {
+    spot_id: spotE.id,
+    plate: icePlate,
+    is_new_energy: false,
+    gate: '地库 B2 入口',
+    note: '临时车，人工登记放行',
+    entered_at: at(-15),
+  });
+  const accessLogs = await api('GET', `/operations/access-logs?plate=${encodeURIComponent(icePlate)}`, prop.token);
+  check('可调取占用车辆入场记录（燃油车、无匹配预约）',
+    accessLogs.some((g) => g.plate === icePlate && g.is_new_energy === false && g.matched_reservation_id == null),
+    accessLogs);
+
+  // 新能源车主预约充电位（目标电量 90%）并入场
+  const reserveE = await api('POST', '/reservations', driver1.token, {
+    spot_id: spotE.id,
+    vehicle_id: neCar.id,
+    start_at: at(0),
+    end_at: at(180),
+    target_charge_pct: 90,
+  });
+  await api('POST', '/operations/gate/admit', prop.token, {
+    reservation_id: reserveE.id, plate: neCar.plate, gate: '南门入口', mode: 'auto', entry_at: at(0),
+  });
+
+  // 缺证据应被拒绝（无桩编号/照片）
+  let badRejected = false;
+  try {
+    await api('POST', '/appeals', driver1.token, { reservation_id: reserveE.id, appeal_type: 'ice_charger', reason: 'x' });
+  } catch { badRejected = true; }
+  check('充电位错占申诉强制要求充电桩编号/到达时间/照片', badRejected);
+
+  // 车主发起错占申诉：照片 + 充电桩编号 + 到达时间 + 占用车牌
+  const appealE = await api('POST', '/appeals', driver1.token, {
+    reservation_id: reserveE.id,
+    appeal_type: 'ice_charger',
+    reason: '到场发现充电位被燃油车占用，等待许久未挪车，最终未能充满',
+    photo_url: `evidence/ice-${RUN}.jpg`,
+    charger_code: 'CHG-B2-03',
+    arrival_at: at(0),
+    occupier_plate: icePlate,
+    target_charge_pct: 90,
+  });
+  check('申诉单类型为充电位错占并带充电桩编号', appealE.appeal.appeal_type === 'ice_charger' && appealE.appeal.charger_code === 'CHG-B2-03');
+  check('系统自动调取占用车入场记录进入证据链',
+    appealE.adjudication.evidenceTimeline.some((e) => e.source === 'gate_access' && e.content.includes(icePlate)),
+    appealE.adjudication.evidenceTimeline.map((e) => e.source));
+  check('自动判陌生燃油车主责任（无有效预约）', appealE.adjudication.ruling === 'stranger', appealE.adjudication);
+  check('裁决识别出占用车牌', appealE.adjudication.occupierPlate === icePlate, appealE.adjudication.occupierPlate);
+
+  // 自动生成燃油车占充电位工单
+  const openIce = await api('GET', '/dispatch/incidents?status=open', prop.token);
+  const iceTicket = openIce.find((t) => t.type === 'ice_occupy_charger' && t.reservation_id === reserveE.id);
+  check('调度看板收到燃油车占充电位工单', !!iceTicket, openIce.map((t) => `${t.type}:${t.reservation_id}`));
+
+  // 物业巡查补录照片证据（中文说明命中燃油车判责）
+  await api('POST', '/operations/patrol', prop.token, {
+    spot_id: spotE.id,
+    plate: icePlate,
+    finding: 'ice_on_charger',
+    note: '燃油车占用充电位 CHG-B2-03，已拍照',
+    media_url: `evidence/patrol-ice-${RUN}.jpg`,
+    patrolled_at: at(5),
+  });
+
+  // 物业接单处置：联系挪车
+  const disp = await api('POST', `/appeals/${appealE.appeal.id}/disposition`, prop.token, {
+    disposition: 'move_notice',
+    note: '已电话通知燃油车主挪车',
+  });
+  check('物业处置-联系挪车并记录占用车牌', disp.ok && disp.target_plate === icePlate, disp);
+  const iceNotices = await api('GET', `/dispatch/incidents/${iceTicket.id}/notices`, prop.token);
+  check('挪车通知已送达占用燃油车', iceNotices.some((n) => n.target_plate === icePlate && n.delivered_at));
+
+  // 30 分钟后燃油车驶离，工单关闭（用于计算等待时长）
+  await api('POST', `/dispatch/incidents/${iceTicket.id}/resolve`, prop.token, {
+    resolution: '燃油车已驶离，新能源车主改充，时间已晚',
+    resolved_at: at(30),
+  });
+
+  // 终裁陌生车主责任
+  await api('POST', `/appeals/${appealE.appeal.id}/rule`, prop.token, {
+    ruling: 'stranger',
+    note: '入场记录+照片+巡查证明无预约燃油车占用充电位',
+  });
+
+  // 执行燃油车违约：锁定车主账号 → 违约金 80、押金没收 30、挂账 50、信用 -15、停约
+  const enforce = await api('POST', `/appeals/${appealE.appeal.id}/enforce-violation`, prop.token, {});
+  check('违约已锁定燃油车平台账号', enforce.identified === true && !!enforce.violation.id, enforce);
+  check('违约金 80 元', Number(enforce.violation.fine) === 80, enforce.violation);
+  check('押金没收 30 元', Number(enforce.violation.deposit_deducted) === 30, enforce.violation);
+  check('押金不足挂账追缴 50 元', Number(enforce.violation.receivable) === 50, enforce.violation);
+  check('违约信用 -15', Number(enforce.violation.credit_delta) === -15);
+  check('挂账未补缴前停约', enforce.violation.booking_restriction === 'blocked', enforce.violation);
+
+  // 燃油车主在停约期内预约普通车位被拒
+  const iceVehicles = await api('GET', '/vehicles', iceToken);
+  const iceVeh = iceVehicles.find((v) => v.plate === icePlate);
+  let blockedRejected = false;
+  try {
+    await api('POST', '/reservations', iceToken, { spot_id: spotB.id, vehicle_id: iceVeh.id, start_at: at(200), end_at: at(260) });
+  } catch { blockedRejected = true; }
+  check('停约期内燃油车主无法预约（全部车位）', blockedRejected);
+
+  const iceWallet = await api('GET', '/wallet', iceToken);
+  check('燃油车主押金余额被扣减至 0', Number(iceWallet.deposit_balance) === 0, iceWallet.deposit_balance);
+  check('钱包展示生效停约限制', iceWallet.active_restrictions.some((v) => v.booking_restriction === 'blocked'));
+
+  // 管理员可查违约记录与挂账金额
+  const violations = await api('GET', '/violations', admin.token);
+  const vRow = violations.find((v) => v.appeal_id === appealE.appeal.id);
+  check('管理员违约监管可查该记录（含车主/车位/挂账）', !!vRow && Number(vRow.receivable) === 50 && vRow.user_name === '燃油车老周', vRow);
+
+  // 新能源车主离场：实际仅充到 40%（目标 90%），结算补电补偿
+  const stE = await api('POST', `/reservations/${reserveE.id}/exit`, driver1.token, {
+    charge_kwh: 20,
+    actual_charge_pct: 40,
+    exit_at: at(120),
+  });
+  // 缺口 50% × 60kWh = 30kWh × 1.2 = 36 元；等待 30 分钟 × 0.3 = 9 元；联系挪车无替代桩 → 补电补偿 45 元
+  check('未充满补电补偿 45 元（能量 36 + 等待 9）', Number(stE.recharge_compensation) === 45, stE.recharge_compensation);
+  check('结算单列违约押金没收 30 元', Number(stE.deposit_forfeit) === 30, stE.deposit_forfeit);
+  check('结算单列挂账继续追缴 50 元', Number(stE.violation_recovery) === 50, stE.violation_recovery);
+  // 现金补偿：陌生车占位 20 + 补电 45 = 65；充电费 24；预付 15 → 退款 = 15+65-24 = 56
+  check('补电补偿随退款发放给新能源车主（退款 56 = 预付 15 + 现金补偿 65 - 充电费 24）', Number(stE.refund) === 56, stE.refund);
+  check('流水含没收押金冲抵平台垫付', stE.ledger.some((l) => l.memo.includes('没收押金')));
+  check('E 资金流水借贷平衡', ledgerBalanced(stE.ledger));
+
+  // 终裁后重算仍平衡，补电补偿稳定
+  const reE = await api('POST', `/appeals/${appealE.appeal.id}/resettle`, prop.token);
+  check('E 重算后补电补偿与押金追缴保持且借贷平衡', Number(reE.recharge_compensation) === 45 && ledgerBalanced(reE.ledger), reE);
+
+  // 燃油车主补缴挂账后恢复预约权限
+  const repay = await api('POST', `/violations/${vRow.id}/repay`, iceToken, {});
+  check('补缴挂账 50 元成功', Number(repay.repaid) === 50, repay);
+  const reserveAfter = await api('POST', '/reservations', iceToken, { spot_id: spotB.id, vehicle_id: iceVeh.id, start_at: at(300), end_at: at(340) });
+  check('补缴后可重新预约（停约解除）', !!reserveAfter.id, reserveAfter);
+  await api('POST', `/reservations/${reserveAfter.id}/cancel`, iceToken);
+
+  // 证据链含充电桩编号/入场记录/照片三类
+  const appealEDetail = await api('GET', `/appeals/${appealE.appeal.id}`, prop.token);
+  check('申诉档案含充电桩编号与入场记录证据',
+    ['charger_info', 'gate_access', 'photo'].every((src) => appealEDetail.evidence.some((e) => e.source === src)),
+    appealEDetail.evidence.map((e) => e.source));
+
+  console.log('== 8. 共同追溯：分账流水、调度总览、单订单全链路事件、巡查档案 ==');
   const ledger = await api('GET', '/ledger', prop.token);
   check(
     '分账流水覆盖车主/业主/物业/平台/券池/托管账户',

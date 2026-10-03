@@ -112,10 +112,12 @@ export class OperationsController {
   ) {
     return this.db.withTx(async (c) => {
       const { rows } = await c.query(
-        `SELECT r.*, s.code AS spot_code, s.location_desc, c.name AS community_name
+        `SELECT r.*, s.code AS spot_code, s.location_desc, s.community_id, c.name AS community_name,
+                v.is_new_energy
          FROM reservations r
          JOIN parking_spots s ON s.id=r.spot_id
          JOIN communities c ON c.id=s.community_id
+         JOIN vehicles v ON v.id=r.vehicle_id
          WHERE r.id=$1 FOR UPDATE`,
         [body.reservation_id],
       );
@@ -124,6 +126,7 @@ export class OperationsController {
       if (!['reserved', 'admitted'].includes(r.status)) throw new BadRequestException('预约状态不可入场');
 
       const manual = body.mode === 'manual';
+      const entryAt = body.entry_at ? new Date(body.entry_at) : new Date();
       await c.query(
         `UPDATE reservations SET status='admitted', gate_entry_at=COALESCE($2::timestamptz, gate_entry_at, now()) WHERE id=$1`,
         [r.id, body.entry_at ?? null],
@@ -141,6 +144,25 @@ export class OperationsController {
           body.gate,
           body.confidence ?? (manual ? null : 0.95),
           JSON.stringify({ mode: body.mode, note: body.note ?? null }),
+        ],
+      );
+      // 道闸进场台账：申诉错占时据此调取入场凭证
+      await c.query(
+        `INSERT INTO gate_access_logs(community_id, spot_id, gate, plate, plate_color, is_new_energy,
+           matched_reservation_id, entry_mode, confidence, detail, entered_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+        [
+          r.community_id,
+          r.spot_id,
+          body.gate,
+          body.plate,
+          '蓝牌',
+          r.is_new_energy,
+          r.id,
+          body.mode,
+          body.confidence ?? (manual ? null : 0.95),
+          JSON.stringify({ mode: body.mode, note: body.note ?? null, admitted_by: user.sub }),
+          entryAt,
         ],
       );
       if (manual) {
@@ -322,6 +344,64 @@ export class OperationsController {
          ${spotId ? 'WHERE p.spot_id=$1' : ''}
          ORDER BY p.patrolled_at DESC LIMIT 100`,
         spotId ? [spotId] : [],
+      )
+      .then((r) => r.rows);
+  }
+
+  // 道闸/物业登记外来车辆入场（无平台预约的燃油车等），形成 gate_access_logs 进场台账
+  @Roles('property', 'admin')
+  @Post('gate/access-log')
+  async accessLog(
+    @CurrentUser() user: JwtUser,
+    @Body() body: { spot_id?: number; plate: string; plate_color?: string; is_new_energy?: boolean; gate?: string; confidence?: number; entered_at?: string; note?: string },
+  ) {
+    const plate = normalizePlate(body.plate);
+    const enteredAt = body.entered_at ? new Date(body.entered_at) : new Date();
+    let communityId: number | null = null;
+    if (body.spot_id) {
+      const s = await this.db.query(`SELECT community_id FROM parking_spots WHERE id=$1`, [body.spot_id]);
+      communityId = s.rows[0]?.community_id ?? null;
+    }
+    const ins = await this.db.query(
+      `INSERT INTO gate_access_logs(community_id, spot_id, gate, plate, plate_color, is_new_energy,
+         matched_reservation_id, entry_mode, confidence, detail, entered_at)
+       VALUES ($1,$2,$3,$4,$5,$6,NULL,'manual',$7,$8,$9) RETURNING *`,
+      [
+        communityId,
+        body.spot_id ?? null,
+        body.gate ?? '地库道闸',
+        plate,
+        body.plate_color ?? '蓝牌',
+        body.is_new_energy ?? false,
+        body.confidence ?? null,
+        JSON.stringify({ note: body.note ?? '外来车辆登记入场', registered_by: user.sub }),
+        enteredAt,
+      ],
+    );
+    return ins.rows[0];
+  }
+
+  // 入场台账查询（申诉时调取占用车辆入场记录；可按车牌/车位）
+  @Get('access-logs')
+  accessLogs(@Query('plate') plate?: string, @Query('spot_id') spotId?: string) {
+    const params: any[] = [];
+    const conds: string[] = [];
+    if (plate) {
+      params.push(normalizePlate(plate));
+      conds.push(`REPLACE(REPLACE(UPPER(g.plate),' ',''),'-','')=$${params.length}`);
+    }
+    if (spotId) {
+      params.push(Number(spotId));
+      conds.push(`g.spot_id=$${params.length}`);
+    }
+    const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+    return this.db
+      .query(
+        `SELECT g.*, s.code AS spot_code, c.name AS community_name FROM gate_access_logs g
+         LEFT JOIN parking_spots s ON s.id=g.spot_id
+         LEFT JOIN communities c ON c.id=g.community_id
+         ${where} ORDER BY g.entered_at DESC LIMIT 100`,
+        params,
       )
       .then((r) => r.rows);
   }

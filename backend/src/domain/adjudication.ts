@@ -11,7 +11,9 @@ export type EvidenceSource =
   | 'owner_home'
   | 'patrol'
   | 'appeal_statement'
-  | 'signal';
+  | 'signal'
+  | 'charger_info'
+  | 'gate_access';
 
 export interface EvidenceItem {
   source: EvidenceSource;
@@ -36,6 +38,11 @@ export interface AdjudicationInput {
   incidents: Array<{ type: string; started_at?: Date | null; resolved_at?: Date | null }>;
   reservationStart: Date;
   reservationEnd: Date;
+  // 充电位错占：现场充电桩编号、占用车辆是否为燃油车、该占用车是否持有有效预约
+  appealType?: 'wrong_parking' | 'ice_charger';
+  chargerCode?: string | null;
+  occupierIsIce?: boolean;
+  occupierHasReservation?: boolean;
 }
 
 export interface AdjudicationResult {
@@ -45,12 +52,15 @@ export interface AdjudicationResult {
   reasons: string[];
   evidenceTimeline: Array<{ at: Date | null; source: EvidenceSource; content: string }>;
   autoCreditDelta: number;
+  occupierPlate?: string | null;
 }
 
 const SOURCE_WEIGHT: Record<EvidenceSource, number> = {
   plate_recognition: 0.9,
+  gate_access: 0.88,
   gate_log: 0.85,
   patrol: 0.8,
+  charger_info: 0.78,
   photo: 0.7,
   owner_home: 0.75,
   reservation: 0.6,
@@ -70,6 +80,49 @@ export function adjudicateAppeal(input: AdjudicationInput): AdjudicationResult {
 
   const plateMismatch =
     !!input.actualPlate && normalize(input.actualPlate) !== normalize(input.reservedPlate);
+
+  // ---- 充电位被燃油车错占：以充电桩编号 + 入场记录 + 现场照片形成闭环 ----
+  let occupierPlate: string | null = input.actualPlate ?? null;
+  if (input.appealType === 'ice_charger') {
+    const chargerEv = input.evidence.find((e) => e.source === 'charger_info');
+    const accessEv = input.evidence.find((e) => e.source === 'gate_access');
+    const photoEv = input.evidence.find((e) => e.source === 'photo');
+    const patrolIce = input.evidence.find(
+      (e) => e.source === 'patrol' && /燃油|油车|ICE|非新能源|占用/i.test(e.content),
+    );
+    if (accessEv && !occupierPlate) {
+      occupierPlate = accessEv.content.match(/[一-龥][A-Z][A-Z0-9]{4,6}/)?.[0] ?? null;
+    }
+    let iceScore = 0;
+    if (chargerEv) {
+      iceScore += SOURCE_WEIGHT.charger_info;
+      reasons.push(`现场充电桩编号核验：${chargerEv.content}（预约车位确为带桩充电位）`);
+    }
+    if (accessEv) {
+      iceScore += SOURCE_WEIGHT.gate_access;
+      reasons.push(`调取占用车辆入场记录：${accessEv.content}`);
+    }
+    if (photoEv) {
+      iceScore += SOURCE_WEIGHT.photo * 0.8;
+      reasons.push('现场照片显示充电位被非新能源车辆占用');
+    }
+    if (patrolIce) {
+      iceScore += SOURCE_WEIGHT.patrol;
+      reasons.push('物业巡查确认燃油车占用充电位：' + patrolIce.content);
+    }
+    if (input.occupierHasReservation) {
+      // 占用车持有效预约：属排期/引导冲突，不判陌生车主，转混合或物业平台责任
+      scorecard.mixed += iceScore * 0.6;
+      reasons.push('占用车辆持有该充电位有效预约，属排期/引导冲突，不由该车主承担违约责任');
+    } else {
+      // 无有效预约的燃油车：陌生车主责任（肇事燃油车主），平台先行兜底后追缴
+      scorecard.stranger += iceScore;
+      reasons.push(
+        `占用车辆（${occupierPlate ?? '车牌待核'}）为燃油车且无该充电位有效预约，` +
+          '判定肇事燃油车主责任：平台先行赔付新能源车主并向其追缴，记录违约、影响预约权限与押金',
+      );
+    }
+  }
 
   // ---- 车牌识别证据 ----
   const recognitions = input.evidence.filter((e) => e.source === 'plate_recognition');
@@ -232,6 +285,7 @@ export function adjudicateAppeal(input: AdjudicationInput): AdjudicationResult {
     reasons,
     evidenceTimeline,
     autoCreditDelta,
+    occupierPlate,
   };
 }
 

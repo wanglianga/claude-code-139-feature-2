@@ -3,7 +3,7 @@ import { api, qs } from '../api';
 import { useLoader } from '../hooks';
 import { WorkspaceShell } from '../App';
 import { accountLabel } from '../components';
-import { dt, money, Tag } from '../ui';
+import { dt, money, RESTRICTION_LABEL, Tag } from '../ui';
 import { OrderTable } from './owner';
 import { ReservationDetailModal } from './shared';
 
@@ -11,6 +11,7 @@ type Session = any;
 const NAV = [
   { key: 'overview', label: '平台总览', icon: '📊' },
   { key: 'ledger', label: '分账监管', icon: '💰' },
+  { key: 'violations', label: '违约与押金', icon: '⚖️' },
   { key: 'orders', label: '订单追溯', icon: '🧾' },
   { key: 'dispatch', label: '调度总览', icon: '🌙' },
   { key: 'coupons', label: '补偿券发放', icon: '🎫' },
@@ -22,6 +23,7 @@ export function AdminWorkspace({ session }: { session: Session }) {
     <WorkspaceShell session={session} nav={NAV} active={tab} onNav={setTab}>
       {tab === 'overview' && <OverviewTab go={setTab} />}
       {tab === 'ledger' && <LedgerTab />}
+      {tab === 'violations' && <ViolationsTab />}
       {tab === 'orders' && <OrdersTab />}
       {tab === 'dispatch' && <DispatchTab />}
       {tab === 'coupons' && <CouponTab />}
@@ -177,6 +179,67 @@ function DispatchTab() {
                   <td className="small muted">{dt(t.created_at)}</td>
                 </tr>
               ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------- 违约与押金监管 ----------
+function ViolationsTab() {
+  const [status, setStatus] = useState('');
+  const [plate, setPlate] = useState('');
+  const query = qs({ status: status || undefined, plate: plate || undefined });
+  const { data: violations, reload } = useLoader<any[]>(`/violations${query}`);
+  const [msg, setMsg] = useState('');
+
+  const totalFine = (violations ?? []).reduce((a, v) => a + Number(v.fine), 0);
+  const totalForfeit = (violations ?? []).reduce((a, v) => a + Number(v.deposit_deducted), 0);
+  const totalReceivable = (violations ?? []).reduce((a, v) => a + Number(v.receivable), 0);
+
+  return (
+    <div>
+      <PageHead title="燃油车违约与押金监管" desc="无有效预约占用充电位的燃油车：违约金、押金没收、挂账追缴、信用扣减与后续预约权限限制；含未识别账号的按车牌挂账" right={
+        <button className="btn ghost" onClick={reload}>刷新</button>
+      } />
+      {msg && <div className="alert ok">{msg}</div>}
+      <div className="grid grid-3" style={{ marginBottom: 16 }}>
+        <div className="stat"><div className="label">违约金合计</div><div className="value">{money(totalFine)}</div><div className="sub">本筛选结果</div></div>
+        <div className="stat"><div className="label">押金已没收</div><div className="value text-green" style={{ color: 'var(--green)' }}>{money(totalForfeit)}</div><div className="sub">已冲抵平台垫付</div></div>
+        <div className="stat"><div className="label">挂账待追缴</div><div className="value" style={{ color: totalReceivable > 0 ? 'var(--red)' : undefined }}>{money(totalReceivable)}</div><div className="sub">追缴到位前限制预约</div></div>
+      </div>
+      <div className="card">
+        <div className="filter-bar">
+          <h3 style={{ margin: 0 }}>违约记录</h3>
+          <input className="mono" style={{ maxWidth: 180 }} placeholder="按车牌查询" value={plate}
+            onChange={(e) => setPlate(e.target.value.toUpperCase())} />
+          <span style={{ flex: 1 }} />
+          {[['', '全部'], ['enforced', '已执行'], ['pending_recovery', '追缴中'], ['closed', '已关闭']].map(([v, l]) => (
+            <button key={v} className={`btn sm ${status === v ? '' : 'gray'}`} onClick={() => setStatus(v)}>{l}</button>
+          ))}
+        </div>
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>违约单</th><th>车牌/车主</th><th>车位/申诉</th><th>违约金</th><th>押金没收</th><th>挂账</th><th>信用/权限</th><th>状态</th></tr></thead>
+            <tbody>
+              {(violations ?? []).map((v) => (
+                <tr key={v.id}>
+                  <td className="mono small">{v.code}<div className="small muted">{dt(v.created_at)}</div></td>
+                  <td className="mono">{v.plate}<div className="small muted">{v.user_name ?? <span style={{ color: 'var(--red)' }}>未识别账号·按车牌挂账</span>}</div></td>
+                  <td className="small">{v.spot_code ?? '—'}<div className="small muted">{v.appeal_code ?? ''}</div></td>
+                  <td className="money">{money(v.fine)}</td>
+                  <td className="money">{money(v.deposit_deducted)}</td>
+                  <td className="money" style={{ color: Number(v.receivable) > 0 ? 'var(--red)' : undefined }}>{money(v.receivable)}</td>
+                  <td>
+                    <div className="small">{v.credit_delta} 信用</div>
+                    <Tag {...(RESTRICTION_LABEL[v.booking_restriction] ? { cls: RESTRICTION_LABEL[v.booking_restriction].cls, label: RESTRICTION_LABEL[v.booking_restriction].label } : { label: v.booking_restriction })} />
+                  </td>
+                  <td><Tag status={v.status === 'pending_recovery' ? 'notified' : v.status === 'closed' ? 'closed' : 'resolved'} /></td>
+                </tr>
+              ))}
+              {(violations ?? []).length === 0 && <tr><td colSpan={8} className="empty">暂无违约记录</td></tr>}
             </tbody>
           </table>
         </div>

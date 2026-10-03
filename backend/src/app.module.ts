@@ -8,6 +8,7 @@ import { OperationsModule } from './operations/operations.module';
 import { DispatchModule } from './dispatch/dispatch.module';
 import { AppealsModule } from './appeals/appeals.module';
 import { SettlementModule } from './settlement/settlement.module';
+import { ChargingModule } from './charging/charging.module';
 
 @Module({
   imports: [
@@ -20,6 +21,7 @@ import { SettlementModule } from './settlement/settlement.module';
     DispatchModule,
     AppealsModule,
     SettlementModule,
+    ChargingModule,
   ],
 })
 export class AppModule {}

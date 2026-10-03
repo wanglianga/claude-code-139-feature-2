@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS vehicles (
   is_new_energy BOOLEAN NOT NULL DEFAULT false,
   is_monthly BOOLEAN NOT NULL DEFAULT false,
   is_visitor BOOLEAN NOT NULL DEFAULT false,
+  battery_capacity_kwh NUMERIC(6,1),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE(user_id, plate)
 );
@@ -157,7 +158,8 @@ CREATE TABLE IF NOT EXISTS appeal_evidence (
   id BIGSERIAL PRIMARY KEY,
   appeal_id BIGINT NOT NULL REFERENCES appeals(id) ON DELETE CASCADE,
   source TEXT NOT NULL CHECK (source IN (
-    'plate_recognition','reservation','photo','gate_log','owner_home','patrol','appeal_statement','signal'
+    'plate_recognition','reservation','photo','gate_log','owner_home','patrol',
+    'appeal_statement','signal','charger_info','gate_access'
   )),
   title TEXT NOT NULL,
   content TEXT,
@@ -235,5 +237,111 @@ CREATE TABLE IF NOT EXISTS patrol_logs (
   patrolled_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- 道闸进场台账：车辆入场记录（申诉"燃油车占用充电位"时据此调取占用车辆的入场凭证）
+CREATE TABLE IF NOT EXISTS gate_access_logs (
+  id BIGSERIAL PRIMARY KEY,
+  community_id BIGINT REFERENCES communities(id),
+  spot_id BIGINT REFERENCES parking_spots(id),
+  gate TEXT,
+  plate TEXT NOT NULL,
+  plate_color TEXT,
+  is_new_energy BOOLEAN,
+  matched_reservation_id BIGINT REFERENCES reservations(id),
+  entry_mode TEXT CHECK (entry_mode IN ('auto','manual')),
+  confidence NUMERIC(5,2),
+  detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+  entered_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_gate_logs_plate_time ON gate_access_logs(plate, entered_at);
+CREATE INDEX IF NOT EXISTS idx_gate_logs_spot_time ON gate_access_logs(spot_id, entered_at);
+
+-- 违约记录：燃油车无有效预约占用充电位等，挂钩违约金、押金没收、信用与预约权限限制、挂账追缴
+CREATE TABLE IF NOT EXISTS violation_records (
+  id BIGSERIAL PRIMARY KEY,
+  code TEXT UNIQUE NOT NULL,
+  user_id BIGINT REFERENCES users(id),        -- 识别到平台账号时入账；无账号则挂账（NULL）
+  plate TEXT NOT NULL,
+  type TEXT NOT NULL DEFAULT 'ice_occupy_charger'
+    CHECK (type IN ('ice_occupy_charger','stranger_occupy','wrong_parking')),
+  reservation_id BIGINT REFERENCES reservations(id), -- 受害预约单（被错占的新能源预约）
+  appeal_id BIGINT REFERENCES appeals(id),
+  spot_id BIGINT REFERENCES parking_spots(id),
+  fine NUMERIC(10,2) NOT NULL DEFAULT 0,       -- 违约金总额
+  deposit_deducted NUMERIC(10,2) NOT NULL DEFAULT 0,-- 已从押金没收的部分
+  receivable NUMERIC(10,2) NOT NULL DEFAULT 0,     -- 押金不足/无账号，平台挂账向车主追缴
+  credit_delta INT NOT NULL DEFAULT 0,
+  booking_restriction TEXT NOT NULL DEFAULT 'none'
+    CHECK (booking_restriction IN ('none','restricted','blocked')),
+  restriction_days INT NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'enforced'
+    CHECK (status IN ('enforced','pending_recovery','closed')),
+  note TEXT,
+  created_by BIGINT REFERENCES users(id),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_violations_user ON violation_records(user_id);
+CREATE INDEX IF NOT EXISTS idx_violations_plate ON violation_records(plate);
+
+-- 押金流水：充值（topup）/ 违约没收（deduct）/ 挂账追缴补缴（repay）/ 退还（refund）
+CREATE TABLE IF NOT EXISTS deposit_transactions (
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  direction TEXT NOT NULL CHECK (direction IN ('topup','deduct','refund','repay')),
+  amount NUMERIC(10,2) NOT NULL,
+  violation_id BIGINT REFERENCES violation_records(id),
+  memo TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_deposit_tx_user ON deposit_transactions(user_id);
+
 -- 幂等迁移：为旧版本库补充后续新增列
 ALTER TABLE settlements ADD COLUMN IF NOT EXISTS coupon_compensation NUMERIC(10,2) NOT NULL DEFAULT 0;
+
+-- ---- 充电车位错占申诉特性（幂等）----
+-- 用户押金余额（违约没收/追缴的资金来源）
+ALTER TABLE users ADD COLUMN IF NOT EXISTS deposit_balance NUMERIC(10,2) NOT NULL DEFAULT 0;
+
+-- 申诉扩展为两类：普通错停 wrong_parking / 充电位被燃油车错占 ice_charger
+ALTER TABLE appeals ADD COLUMN IF NOT EXISTS appeal_type TEXT NOT NULL DEFAULT 'wrong_parking'
+  CHECK (appeal_type IN ('wrong_parking','ice_charger'));
+ALTER TABLE appeals ADD COLUMN IF NOT EXISTS charger_code TEXT;        -- 现场充电桩编号
+ALTER TABLE appeals ADD COLUMN IF NOT EXISTS arrival_at TIMESTAMPTZ;  -- 车主到达时间
+ALTER TABLE appeals ADD COLUMN IF NOT EXISTS occupier_plate TEXT;     -- 现场占用车辆车牌（燃油车）
+ALTER TABLE appeals ADD COLUMN IF NOT EXISTS disposition TEXT         -- 物业处置：联系挪车/替代充电桩/免除预约费用
+  CHECK (disposition IN ('move_notice','alternate_charger','waive_fee'));
+ALTER TABLE appeals ADD COLUMN IF NOT EXISTS disposition_note TEXT;
+ALTER TABLE appeals ADD COLUMN IF NOT EXISTS handled_by BIGINT REFERENCES users(id);
+ALTER TABLE appeals ADD COLUMN IF NOT EXISTS handled_at TIMESTAMPTZ;
+
+-- 预约目标充电量百分比（用于"未充满"补电补偿计算）
+ALTER TABLE reservations ADD COLUMN IF NOT EXISTS target_charge_pct INT;
+-- 车辆电池容量（用于换算未充满的缺口电量）
+ALTER TABLE vehicles ADD COLUMN IF NOT EXISTS battery_capacity_kwh NUMERIC(6,1);
+
+-- 结算扩展：新能源车未充满的补电补偿、燃油车违约押金没收、平台挂账追缴
+ALTER TABLE settlements ADD COLUMN IF NOT EXISTS recharge_compensation NUMERIC(10,2) NOT NULL DEFAULT 0;
+ALTER TABLE settlements ADD COLUMN IF NOT EXISTS deposit_forfeit NUMERIC(10,2) NOT NULL DEFAULT 0;
+ALTER TABLE settlements ADD COLUMN IF NOT EXISTS violation_recovery NUMERIC(10,2) NOT NULL DEFAULT 0;
+ALTER TABLE settlements ADD COLUMN IF NOT EXISTS violation_id BIGINT REFERENCES violation_records(id);
+
+-- 旧库 appeal_evidence.source 的 CHECK 可能不含新增来源（charger_info/gate_access），幂等替换
+DO $$
+DECLARE cname TEXT;
+BEGIN
+  SELECT conname INTO cname FROM pg_constraint
+   WHERE conrelid = 'appeal_evidence'::regclass AND contype = 'c' AND conname LIKE 'appeal_evidence_source%';
+  IF cname IS NOT NULL THEN
+    EXECUTE format('ALTER TABLE appeal_evidence DROP CONSTRAINT %I', cname);
+  END IF;
+END $$;
+DO $$
+DECLARE cname TEXT;
+BEGIN
+  SELECT conname INTO cname FROM pg_constraint
+   WHERE conrelid = 'appeal_evidence'::regclass AND contype = 'c' AND pg_get_constraintdef(oid) LIKE '%charger_info%';
+  IF cname IS NULL THEN
+    ALTER TABLE appeal_evidence ADD CONSTRAINT appeal_evidence_source_chk CHECK (source IN (
+      'plate_recognition','reservation','photo','gate_log','owner_home','patrol',
+      'appeal_statement','signal','charger_info','gate_access'));
+  END IF;
+END $$;

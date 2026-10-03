@@ -74,6 +74,20 @@ export const EVIDENCE_LABEL: Record<string, string> = {
   patrol: '物业巡查',
   appeal_statement: '车主陈述',
   signal: '信号记录',
+  charger_info: '充电桩编号',
+  gate_access: '占用车入场记录',
+};
+
+export const RESTRICTION_LABEL: Record<string, { label: string; cls: string }> = {
+  none: { label: '无限制', cls: 'green' },
+  restricted: { label: '限制预约（7天·不可约充电/月租位）', cls: 'amber' },
+  blocked: { label: '停约（30天·需补缴押金）', cls: 'red' },
+};
+
+export const DISPOSITION_LABEL: Record<string, string> = {
+  move_notice: '联系挪车',
+  alternate_charger: '安排替代充电桩',
+  waive_fee: '免除预约费用',
 };
 
 export function Tag({ status, label, cls }: { status?: string; label?: string; cls?: string }) {

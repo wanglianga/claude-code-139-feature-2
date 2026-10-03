@@ -5,7 +5,7 @@ import { DbService } from '../database/db.service';
 import { adjudicateAppeal, AdjudicationResult, EvidenceItem } from '../domain/adjudication';
 
 class AddEvidenceDto {
-  source: 'plate_recognition' | 'reservation' | 'photo' | 'gate_log' | 'owner_home' | 'patrol' | 'appeal_statement' | 'signal';
+  source: 'plate_recognition' | 'reservation' | 'photo' | 'gate_log' | 'owner_home' | 'patrol' | 'appeal_statement' | 'signal' | 'charger_info' | 'gate_access';
   title: string;
   content: string;
   media_url?: string;
@@ -18,6 +18,13 @@ class CreateAppealDto {
   reservation_id: number;
   reason: string;
   evidence?: AddEvidenceDto[];
+  // 充电车位错占专项
+  appeal_type?: 'wrong_parking' | 'ice_charger';
+  charger_code?: string;        // 现场充电桩编号
+  arrival_at?: string;          // 到达时间
+  occupier_plate?: string;      // 现场占用车辆（燃油车）车牌
+  photo_url?: string;           // 现场照片
+  target_charge_pct?: number;   // 预约目标电量（%）
 }
 
 @Controller('appeals')
@@ -25,31 +32,57 @@ class CreateAppealDto {
 export class AppealsController {
   constructor(private db: DbService) {}
 
-  // 车主发起错停申诉
+  // 车主发起申诉（普通错停 / 充电位被燃油车错占）
   @Roles('driver')
   @Post()
   async create(@CurrentUser() user: JwtUser, @Body() dto: CreateAppealDto) {
+    const appealType = dto.appeal_type === 'ice_charger' ? 'ice_charger' : 'wrong_parking';
+    if (appealType === 'ice_charger') {
+      if (!dto.charger_code) throw new BadRequestException('充电位错占申诉必须填写现场充电桩编号');
+      if (!dto.arrival_at) throw new BadRequestException('充电位错占申诉必须填写到达时间');
+      if (!dto.photo_url && !(dto.evidence ?? []).some((e) => e.source === 'photo'))
+        throw new BadRequestException('充电位错占申诉必须上传现场照片');
+    }
     return this.db.withTx(async (c) => {
       const r = await c.query(
-        `SELECT r.*, s.code AS spot_code, s.owner_id FROM reservations r
-         JOIN parking_spots s ON s.id=r.spot_id WHERE r.id=$1 AND r.driver_id=$2 FOR UPDATE`,
+        `SELECT r.*, v.is_new_energy, s.code AS spot_code, s.owner_id, s.near_charger
+         FROM reservations r
+         JOIN parking_spots s ON s.id=r.spot_id
+         JOIN vehicles v ON v.id=r.vehicle_id
+         WHERE r.id=$1 AND r.driver_id=$2 FOR UPDATE`,
         [dto.reservation_id, user.sub],
       );
       const reservation = r.rows[0];
       if (!reservation) throw new BadRequestException('预约不存在或不属于本人');
+      if (appealType === 'ice_charger') {
+        if (!reservation.near_charger || !reservation.is_new_energy)
+          throw new BadRequestException('仅新能源车辆预约的带充电桩车位可发起错占申诉');
+      }
 
+      const arrivalAt = dto.arrival_at ? new Date(dto.arrival_at) : new Date();
       const ins = await c.query(
-        `INSERT INTO appeals(code, reservation_id, spot_id, appellant_id, reason, status)
-         VALUES ($1,$2,$3,$4,$5,'open') RETURNING *`,
-        ['A' + Date.now().toString(36).toUpperCase(), dto.reservation_id, reservation.spot_id, user.sub, dto.reason],
+        `INSERT INTO appeals(code, reservation_id, spot_id, appellant_id, reason, status,
+           appeal_type, charger_code, arrival_at, occupier_plate)
+         VALUES ($1,$2,$3,$4,$5,'open',$6,$7,$8,$9) RETURNING *`,
+        [
+          'A' + Date.now().toString(36).toUpperCase(),
+          dto.reservation_id,
+          reservation.spot_id,
+          user.sub,
+          dto.reason,
+          appealType,
+          dto.charger_code ?? null,
+          arrivalAt,
+          dto.occupier_plate ?? null,
+        ],
       );
       const appeal = ins.rows[0];
 
       // 车主陈述 + 自行上传的证据
       await c.query(
         `INSERT INTO appeal_evidence(appeal_id, source, title, content, captured_at, uploaded_by)
-         VALUES ($1,'appeal_statement',$2,$3, now(), $4)`,
-        [appeal.id, '车主申诉陈述', dto.reason, user.sub],
+         VALUES ($1,'appeal_statement',$2,$3, $4, $5)`,
+        [appeal.id, '车主申诉陈述', dto.reason, arrivalAt, user.sub],
       );
       for (const e of dto.evidence ?? []) {
         await c.query(
@@ -61,10 +94,62 @@ export class AppealsController {
             e.title,
             e.content,
             e.media_url ?? null,
-            e.captured_at ? new Date(e.captured_at) : new Date(),
+            e.captured_at ? new Date(e.captured_at) : arrivalAt,
             user.sub,
           ],
         );
+      }
+
+      if (appealType === 'ice_charger') {
+        // 必传的现场照片（若未在 evidence 中给出）
+        if (dto.photo_url) {
+          await c.query(
+            `INSERT INTO appeal_evidence(appeal_id, source, title, content, media_url, captured_at, uploaded_by)
+             VALUES ($1,'photo','现场照片（充电位被燃油车占用）',$2,$3,$4,$5)`,
+            [appeal.id, dto.reason || '现场照片显示充电位被燃油车占用', dto.photo_url, arrivalAt, user.sub],
+          );
+        }
+        // 充电桩编号核验证据
+        await c.query(
+          `INSERT INTO appeal_evidence(appeal_id, source, title, content, captured_at, uploaded_by)
+           VALUES ($1,'charger_info','现场充电桩编号',$2,$3,$4)`,
+          [
+            appeal.id,
+            `充电桩编号 ${dto.charger_code}，对应预约车位 ${reservation.spot_code}（带 ${reservation.spot_code} 充电设施）`,
+            arrivalAt,
+            user.sub,
+          ],
+        );
+        // 记录目标电量
+        if (dto.target_charge_pct != null) {
+          await c.query(`UPDATE reservations SET target_charge_pct=$1 WHERE id=$2`, [
+            Math.max(0, Math.min(100, Number(dto.target_charge_pct))),
+            reservation.id,
+          ]);
+        }
+        // 自动开工单（燃油车占充电位），便于物业派挪车通知/处置
+        await c.query(
+          `INSERT INTO incident_tickets(code, spot_id, reservation_id, type, status, plate, reporter_role, description, detail, created_at)
+           VALUES ($1,$2,$3,'ice_occupy_charger','open',$4,'driver',$5,$6,$7)`,
+          [
+            'T' + Date.now().toString(36).toUpperCase(),
+            reservation.spot_id,
+            reservation.id,
+            dto.occupier_plate ?? null,
+            `新能源车主到场发现充电位被燃油车占用：充电桩 ${dto.charger_code}，${dto.reason ?? ''}`,
+            JSON.stringify({
+              charger_code: dto.charger_code,
+              arrival_at: arrivalAt,
+              occupier_plate: dto.occupier_plate ?? null,
+              appeal_id: appeal.id,
+            }),
+            arrivalAt,
+          ],
+        );
+        // 自动调取占用车辆入场记录
+        if (dto.occupier_plate) {
+          await this.attachGateAccess(c, appeal.id, dto.occupier_plate, reservation.spot_id, arrivalAt);
+        }
       }
 
       const result = await this.runAdjudication(c, appeal.id);
@@ -75,11 +160,52 @@ export class AppealsController {
           dto.reservation_id,
           reservation.spot_id,
           user.sub,
-          JSON.stringify({ appeal_id: appeal.id, auto: result.ruling, confidence: result.confidence }),
+          JSON.stringify({
+            appeal_id: appeal.id,
+            appeal_type: appealType,
+            auto: result.ruling,
+            confidence: result.confidence,
+            occupier_plate: result.occupierPlate ?? null,
+          }),
         ],
       );
       return { appeal, adjudication: result };
     });
+  }
+
+  // 调取占用车辆入场记录并写入证据链（按车牌匹配，限定到场前后 12 小时）
+  private async attachGateAccess(client: any, appealId: number, plate: string, spotId: number, arrivalAt: Date) {
+    const norm = (p: string) => (p || '').replace(/[^0-9A-Z一-龥]/gi, '').toUpperCase();
+    const logs = await client.query(
+      `SELECT * FROM gate_access_logs
+       WHERE REPLACE(REPLACE(UPPER(plate),' ',''),'-','')=$1
+         AND entered_at BETWEEN $2::timestamptz - interval '12 hour' AND $2::timestamptz + interval '2 hour'
+       ORDER BY entered_at DESC LIMIT 5`,
+      [norm(plate), arrivalAt],
+    );
+    if (logs.rows.length === 0) return { matched: 0 };
+    for (const g of logs.rows) {
+      await client.query(
+        `INSERT INTO appeal_evidence(appeal_id, source, title, content, captured_at)
+         VALUES ($1,'gate_access','占用车辆入场记录',$2,$3)`,
+        [
+          appealId,
+          `${g.entered_at instanceof Date ? g.entered_at.toISOString() : g.entered_at} 车牌 ${g.plate}（${g.is_new_energy ? '新能源' : '燃油'}）` +
+            `经 ${g.gate ?? '道闸'}${g.entry_mode === 'manual' ? '人工放行' : '识别放行'}进入` +
+            `${g.spot_code ? `，登记车位 ${g.spot_code}` : ''}；无匹配预约`,
+          g.entered_at,
+        ],
+      );
+    }
+    // 补一条无预约说明
+    const hasRes = await client.query(
+      `SELECT 1 FROM reservations
+       WHERE REPLACE(REPLACE(UPPER(plate),' ',''),'-','')=$1
+         AND spot_id=$2 AND status IN ('reserved','admitted','in_garage')
+       LIMIT 1`,
+      [norm(plate), spotId],
+    );
+    return { matched: logs.rows.length, hasReservation: hasRes.rows.length > 0, logs: logs.rows, isNewEnergy: logs.rows[0]?.is_new_energy };
   }
 
   @Get()
@@ -329,6 +455,42 @@ export class AppealsController {
       if (/stranger/.test(p.note)) actualPlate = p.plate ?? actualPlate;
     }
 
+    // 充电位错占：判定占用车辆是否燃油车、是否持有效预约
+    let occupierIsIce: boolean | undefined;
+    let occupierHasReservation: boolean | undefined;
+    if (appeal.appeal_type === 'ice_charger') {
+      incidents.push({ type: 'ice_occupy_charger', started_at: appeal.arrival_at ?? null });
+      let occupierPlate = appeal.occupier_plate ?? actualPlate;
+      if (!occupierPlate) {
+        const accessStored = stored.rows.find((e: any) => e.source === 'gate_access');
+        occupierPlate = accessStored?.content?.match(/[一-龥][A-Z][A-Z0-9]{4,6}/)?.[0] ?? null;
+      }
+      if (occupierPlate) {
+        actualPlate = occupierPlate;
+        const norm = (p: string) => (p || '').replace(/[^0-9A-Z一-龥]/gi, '').toUpperCase();
+        const gq = await client.query(
+          `SELECT is_new_energy FROM gate_access_logs
+           WHERE REPLACE(REPLACE(UPPER(plate),' ',''),'-','')=$1 ORDER BY entered_at DESC LIMIT 1`,
+          [norm(occupierPlate)],
+        );
+        const vq = await client.query(
+          `SELECT is_new_energy FROM vehicles
+           WHERE REPLACE(REPLACE(UPPER(plate),' ',''),'-','')=$1 ORDER BY id DESC LIMIT 1`,
+          [norm(occupierPlate)],
+        );
+        occupierIsIce =
+          gq.rows[0]?.is_new_energy === false || (gq.rows[0] == null && vq.rows[0]?.is_new_energy === false);
+        const rq = await client.query(
+          `SELECT 1 FROM reservations
+           WHERE REPLACE(REPLACE(UPPER(plate),' ',''),'-','')=$1 AND spot_id=$2
+             AND status IN ('reserved','admitted','in_garage')
+           LIMIT 1`,
+          [norm(occupierPlate), appeal.spot_id],
+        );
+        occupierHasReservation = rq.rows.length > 0;
+      }
+    }
+
     return adjudicateAppeal({
       reservedSpotCode: appeal.spot_code,
       reservedPlate: appeal.reserved_plate ?? appeal.plate,
@@ -337,6 +499,10 @@ export class AppealsController {
       incidents,
       reservationStart: appeal.start_at,
       reservationEnd: appeal.end_at,
+      appealType: appeal.appeal_type ?? 'wrong_parking',
+      chargerCode: appeal.charger_code ?? null,
+      occupierIsIce,
+      occupierHasReservation,
     });
   }
 }

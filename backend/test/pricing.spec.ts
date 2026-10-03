@@ -139,4 +139,30 @@ describe('settlePrice', () => {
       expect(Math.abs(debit - credit)).toBeLessThanOrEqual(0.05);
     }
   });
+
+  test('燃油车占充电位：新能源未充满补电补偿 + 没收押金/挂账追缴，流水借贷平衡', () => {
+    const r = settlePrice({
+      ...baseInput,
+      chargeKwh: 0,
+      prepaid: 15,
+      incidents: [{ type: 'ice_occupy_charger' }],
+      ruling: 'stranger',
+      rechargeCompensation: 55, // 缺口电量 36 + 等待 9 + 替代桩 10
+      violationForfeit: 50,     // 燃油车主押金被没收 50
+      violationReceivable: 30,  // 押金不足，30 元挂账（不进现金流水）
+      violationUserId: 9,
+      violationPlate: '沪A98765',
+    });
+    // 服务费全免
+    expect(r.baseFee).toBe(0);
+    // 异常补偿含原陌生车补偿 20 + 业主 30 ... 车主侧现金补偿 = 20 + 55 = 75
+    expect(r.rechargeCompensation).toBe(55);
+    expect(r.depositForfeit).toBe(50);
+    expect(r.violationRecovery).toBe(30);
+    // 押金没收进入流水、挂账追缴不进入现金流水
+    expect(r.ledger.some((l) => l.memo.includes('没收押金'))).toBe(true);
+    const debit = r.ledger.filter((l) => l.direction === 'debit').reduce((a, b) => a + b.amount, 0);
+    const credit = r.ledger.filter((l) => l.direction === 'credit').reduce((a, b) => a + b.amount, 0);
+    expect(Math.abs(debit - credit)).toBeLessThanOrEqual(0.05);
+  });
 });

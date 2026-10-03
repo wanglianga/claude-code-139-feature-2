@@ -4,10 +4,12 @@ import { JwtUser } from '../auth/auth.service';
 import { DbService } from '../database/db.service';
 import { Ruling, settlePrice, SettlementBreakdown } from '../domain/pricing';
 import { buildSpotTimeline, TimelineIncident, TimelineOrder } from '../domain/timeline';
+import { computeRechargeCompensation } from '../domain/charging';
 
 class ExitDto {
   charge_kwh?: number;
   exit_at?: string; // 道闸时钟/离场补录时间
+  actual_charge_pct?: number; // 离场实际充电量百分比（未充满补电补偿用，缺省按 kWh/电池容量换算）
 }
 
 @Controller()
@@ -21,7 +23,7 @@ export class SettlementController {
     return this.db.withTx(async (c) => {
       const rq = await c.query(
         `SELECT r.*, s.hourly_rate, s.overnight_cap, s.near_charger, s.owner_id,
-                v.is_new_energy, v.plate AS vplate
+                v.is_new_energy, v.battery_capacity_kwh, v.plate AS vplate
          FROM reservations r
          JOIN parking_spots s ON s.id=r.spot_id
          JOIN vehicles v ON v.id=r.vehicle_id
@@ -38,8 +40,23 @@ export class SettlementController {
            gate_exit_at=COALESCE($2::timestamptz, gate_exit_at, now()) WHERE id=$1`,
         [id, exitAt],
       );
+      // 持久化本次充电会话（kwh + 离场实际电量百分比），供申诉终裁重算时读回，保证补电补偿一致
+      if (dto.charge_kwh != null || dto.actual_charge_pct != null) {
+        await c.query(
+          `INSERT INTO service_events(reservation_id, spot_id, type, actor_id, actor_role, plate, detail)
+           VALUES ($1,$2,'charging_session',$3,$4,$5,$6)`,
+          [
+            id,
+            r.spot_id,
+            user.sub,
+            user.role,
+            r.plate,
+            JSON.stringify({ kwh: dto.charge_kwh ?? 0, actual_charge_pct: dto.actual_charge_pct ?? null }),
+          ],
+        );
+      }
 
-      const breakdown = await this.computeBreakdown(c, r, exitAt, dto.charge_kwh ?? 0);
+      const breakdown = await this.computeBreakdown(c, r, exitAt, dto.charge_kwh ?? 0, undefined, undefined, dto.actual_charge_pct);
       const settlement = await this.persistSettlement(c, r, exitAt, breakdown);
 
       // 信用分
@@ -89,7 +106,7 @@ export class SettlementController {
   @Get('reservations/:id/quote')
   async quote(@CurrentUser() user: JwtUser, @Param('id') id: string, @Query('charge_kwh') kwh?: string) {
     const rq = await this.db.query(
-      `SELECT r.*, s.hourly_rate, s.overnight_cap, s.near_charger, s.owner_id, v.is_new_energy
+      `SELECT r.*, s.hourly_rate, s.overnight_cap, s.near_charger, s.owner_id, v.is_new_energy, v.battery_capacity_kwh
        FROM reservations r
        JOIN parking_spots s ON s.id=r.spot_id
        JOIN vehicles v ON v.id=r.vehicle_id
@@ -121,7 +138,7 @@ export class SettlementController {
       const appeal = aq.rows[0];
       if (!appeal) throw new BadRequestException('申诉未终裁，不能重算');
       const rq = await c.query(
-        `SELECT r.*, s.hourly_rate, s.overnight_cap, s.near_charger, s.owner_id, v.is_new_energy
+        `SELECT r.*, s.hourly_rate, s.overnight_cap, s.near_charger, s.owner_id, v.is_new_energy, v.battery_capacity_kwh
          FROM reservations r
          JOIN parking_spots s ON s.id=r.spot_id
          JOIN vehicles v ON v.id=r.vehicle_id
@@ -304,6 +321,7 @@ export class SettlementController {
     chargeKwh: number,
     forcedRuling?: Ruling | null,
     appealId?: number,
+    actualChargePct?: number,
   ): Promise<SettlementBreakdown> {
     // 该笔服务关联的异常
     const iq = await client.query(
@@ -320,12 +338,24 @@ export class SettlementController {
 
     // 申诉裁决（优先使用传入的终裁，其次取已关闭申诉）
     let ruling: Ruling | null = forcedRuling ?? null;
+    let iceAppeal: any = null;
     if (!ruling) {
       const aq = await client.query(
-        `SELECT ruling FROM appeals WHERE reservation_id=$1 AND status='closed' ORDER BY ruled_at DESC NULLS LAST LIMIT 1`,
+        `SELECT * FROM appeals WHERE reservation_id=$1 AND status='closed' ORDER BY ruled_at DESC NULLS LAST LIMIT 1`,
         [r.id],
       );
       ruling = aq.rows[0]?.ruling ?? null;
+      iceAppeal = aq.rows[0]?.appeal_type === 'ice_charger' ? aq.rows[0] : null;
+    } else if (appealId) {
+      const iaq = await client.query(`SELECT * FROM appeals WHERE id=$1`, [appealId]);
+      iceAppeal = iaq.rows[0]?.appeal_type === 'ice_charger' ? iaq.rows[0] : null;
+    } else {
+      const iaq = await client.query(
+        `SELECT * FROM appeals WHERE reservation_id=$1 AND appeal_type='ice_charger' AND status='closed'
+         ORDER BY ruled_at DESC NULLS LAST LIMIT 1`,
+        [r.id],
+      );
+      iceAppeal = iaq.rows[0] ?? null;
     }
 
     // 优惠券抵扣（预约时已核销，这里从 coupon 关联反查）
@@ -335,7 +365,7 @@ export class SettlementController {
     );
     const couponAmount = Number(cq.rows[0].amount);
 
-    // usable_from：若存在陌生车占用，为占用解除时间；否则入场/停车确认时间
+    // usable_from：若存在陌生车/燃油车占用，为占用解除时间；否则入场/停车确认时间
     let usableFrom = r.parking_confirmed_at ?? r.gate_entry_at ?? r.start_at;
     const stranger = iq.rows.find((i: any) => ['stranger_occupy', 'ice_occupy_charger'].includes(i.type));
     if (stranger?.resolved_at && new Date(stranger.resolved_at) > new Date(usableFrom)) {
@@ -344,12 +374,57 @@ export class SettlementController {
 
     // 充电量结算优先使用已持久化的值（重算场景）
     let kwh = chargeKwh;
-    if (!kwh) {
+    let persistedActualPct: number | null = actualChargePct ?? null;
+    if (!kwh || persistedActualPct == null) {
       const detail = await client.query(
         `SELECT detail FROM service_events WHERE reservation_id=$1 AND type='charging_session' ORDER BY id DESC LIMIT 1`,
         [r.id],
       );
-      kwh = Number(detail.rows[0]?.detail?.kwh ?? 0);
+      if (!kwh) kwh = Number(detail.rows[0]?.detail?.kwh ?? 0);
+      if (persistedActualPct == null && detail.rows[0]?.detail?.actual_charge_pct != null) {
+        persistedActualPct = Number(detail.rows[0].detail.actual_charge_pct);
+      }
+    }
+
+    // ---- 新能源未充满补电补偿（仅终裁为陌生车主责任的充电位错占）----
+    let rechargeCompensation = 0;
+    let violationForfeit = 0;
+    let violationReceivable = 0;
+    let violationUserId: number | null = null;
+    let violationPlate: string | null = null;
+    if (iceAppeal && ruling === 'stranger') {
+      const capacity = Number(r.battery_capacity_kwh ?? 60);
+      const targetPct = Number(r.target_charge_pct ?? 90);
+      // 实际电量：优先入参，其次按已充电量/电池容量换算
+      const actualPct =
+        persistedActualPct != null
+          ? Number(persistedActualPct)
+          : capacity > 0
+            ? Math.min(100, Math.round((kwh / capacity) * 100))
+            : targetPct;
+      const iceTicket = iq.rows.find((i: any) => i.type === 'ice_occupy_charger');
+      const started = iceTicket?.started_at ? new Date(iceTicket.started_at) : new Date(iceAppeal.arrival_at);
+      const resolved = iceTicket?.resolved_at ? new Date(iceTicket.resolved_at) : null;
+      const blockedMinutes = resolved ? Math.max(0, Math.round((resolved.getTime() - started.getTime()) / 60000)) : 0;
+      const relocated = iceAppeal.disposition === 'alternate_charger';
+      const rb = computeRechargeCompensation({
+        targetChargePct: targetPct,
+        actualChargePct: actualPct,
+        batteryCapacityKwh: capacity,
+        blockedMinutes,
+        relocatedToAlternate: relocated,
+      });
+      rechargeCompensation = rb.total;
+
+      // 终裁后已执行的燃油车违约：押金没收/挂账追缴入资金流水
+      const vq = await client.query(`SELECT * FROM violation_records WHERE appeal_id=$1 LIMIT 1`, [iceAppeal.id]);
+      const v = vq.rows[0];
+      if (v) {
+        violationForfeit = Number(v.deposit_deducted);
+        violationReceivable = Number(v.receivable);
+        violationUserId = v.user_id ?? null;
+        violationPlate = v.plate;
+      }
     }
 
     return settlePrice({
@@ -366,6 +441,11 @@ export class SettlementController {
       ruling,
       couponAmount,
       prepaid: Number(r.estimated_fee && couponAmount ? Math.max(0, Number(r.estimated_fee) - couponAmount) : (r.estimated_fee ?? 0)),
+      rechargeCompensation,
+      violationForfeit,
+      violationReceivable,
+      violationUserId,
+      violationPlate,
     });
   }
 
@@ -378,14 +458,24 @@ export class SettlementController {
     ruling?: Ruling | null,
   ) {
     const code = 'ST' + Date.now().toString(36).toUpperCase() + Math.floor(Math.random() * 1000).toString(36).toUpperCase();
+    // 关联本单燃油车违约记录（用于押金没收/挂账追缴归集）
+    let violationId: number | null = null;
+    if (b.depositForfeit > 0 || b.violationRecovery > 0) {
+      const vq = await c.query(
+        `SELECT id FROM violation_records WHERE reservation_id=$1 ORDER BY id DESC LIMIT 1`,
+        [r.id],
+      );
+      violationId = vq.rows[0]?.id ?? null;
+    }
     const ins = await c.query(
       `INSERT INTO settlements(code, reservation_id, spot_id, actual_entry_at, actual_exit_at, usable_from,
          duration_minutes, base_fee, charging_fee, overtime_fee, wrong_park_fine,
          coupon_discount, abnormal_compensation, coupon_compensation, owner_compensation, prepaid, refund, exit_charge, payable,
          owner_income, property_fee, platform_fee, owner_share, property_share, platform_share,
-         credit_target, credit_delta, appeal_id, ruling, detail)
+         credit_target, credit_delta, appeal_id, ruling,
+         recharge_compensation, deposit_forfeit, violation_recovery, violation_id, detail)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
-               $19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)
+               $19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34)
        RETURNING *`,
       [
         code, r.id, r.spot_id, b.actualEntryAt, b.actualExitAt, b.usableFrom,
@@ -393,6 +483,7 @@ export class SettlementController {
         b.couponDiscount, b.abnormalCompensation, b.couponCompensation, b.ownerCompensation, b.prepaid, b.refund, b.exitCharge, b.payable,
         b.ownerIncome, b.propertyFee, b.platformFee, b.ownerShare, b.propertyShare, b.platformShare,
         b.creditTarget, b.creditDelta, appealId ?? null, ruling ?? b.ruling,
+        b.rechargeCompensation, b.depositForfeit, b.violationRecovery, violationId,
         JSON.stringify({ notes: b.notes }),
       ],
     );

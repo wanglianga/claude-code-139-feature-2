@@ -1,8 +1,10 @@
-# 社区共享停车：错停申诉 · 收益分账 · 夜间调度平台
+# 社区共享停车：错停申诉 · 充电位错占 · 收益分账 · 夜间调度平台
 
 面向社区夜间共享停车场景的全栈平台：业主发布闲置车位，外来车主预约停车，物业负责审核与夜间调度；
 平台把**车位发布 → 预约 → 入场道闸车牌识别 → 导航引导 → 异常调度 → 离场结算 → 收益分账**绑定到同一笔停车服务，
-并以六类证据链对错停申诉自动给出责任建议、支持人工终裁与分账重算，供业主、车主、物业三方共同追溯。
+以六类证据链对错停申诉自动给出责任建议、支持人工终裁与分账重算；
+并针对**新能源车预约充电位后被燃油车错占**提供专项闭环：现场照片/充电桩编号/到达时间举证、自动调取占用车入场记录、
+物业三选一处置、无有效预约燃油车的违约（违约金/押金没收/挂账追缴/信用与预约权限阶梯）、新能源未充满的补电补偿。供业主、车主、物业三方共同追溯。
 
 - **前端**：React 18 + TypeScript + Vite（业主 / 车主 / 物业 / 平台管理员四个角色工作台）
 - **后端**：NestJS 10 + TypeScript（JWT 鉴权、角色守卫、纯函数领域引擎）
@@ -77,7 +79,7 @@ npm run dev
 | --- | --- | --- | --- |
 | `owner1` | 业主 | 王业主 | 发布产权车位、设置共享时段/充电桩/月租优先、临时回家上报 |
 | `owner2` | 业主 | 李业主 | 第二个业主（含禁访客车位、待审核车位） |
-| `driver1` | 外来车主 | 陈车主 | 新能源**月租车** `沪AD88899`，预约充电位、申诉、领券 |
+| `driver1` | 外来车主 | 陈车主 | 新能源**月租车** `沪AD88899`，预约充电位、充电位错占申诉、领券（种子预置 100 元押金、电池 60kWh） |
 | `driver2` | 外来车主 | 赵访客 | **访客车** `沪A12345`，访客超时/错停场景 |
 | `property1` | 物业 | 值班员小周 | 车位审核、道闸人工放行、夜巡、挪车通知、申诉终裁 |
 | `admin1` | 平台管理员 | 平台管理员 | 分账监管、资金流水、发补偿券、全局订单追溯 |
@@ -115,6 +117,27 @@ npm run dev
 - 责任建议：车主 / 业主 / 物业 / 平台 / 陌生车主 / 混合 / 存疑，含置信度、各方责任得分条与逐条理由、证据时间线；
 - 物业可采纳建议或**人工改判**；终裁后可**一键重算分账**（自动反向冲销旧信用影响再施加新的）。
 
+### 充电车位错占申诉（新能源车主发起 / 物业接单处置）
+新能源车预约带充电桩车位后到场发现被**燃油车占用**时，车主在 App「⚡ 充电位错占申诉」提交三项必备材料：
+**① 现场照片、② 现场充电桩编号、③ 到达时间**（可填占用车牌、预约目标电量百分比）。平台据此：
+- **自动调取占用车辆入场记录**：按车牌检索 `gate_access_logs` 道闸进场台账（含新能源/燃油标识、是否匹配预约），
+  连同**充电桩编号证据**、照片、物业巡查进入证据链；裁决引擎据此判定**无有效预约的燃油车（陌生车主）责任**；
+  若占用车持有效预约则归为排期/引导冲突，不罚该车主。
+- **物业接单三选一处置**：`POST /appeals/:id/disposition`
+  - 📨 **联系挪车**：向占用车发 App 推送 + 车位 LED 挪车通知；
+  - ⚡ **安排替代充电桩**：改派相邻空闲充电位，向新能源车主下发通知并记一次性绕行补偿；
+  - 💰 **免除预约费用**：本次预约费用免除。
+- **燃油车主违约（无有效预约）**：`POST /appeals/:id/enforce-violation`
+  - 违约金 **80 元**、信用 **-15**；优先**从押金没收**，不足部分**挂账追缴**；
+  - 权限阶梯（`src/domain/charging.ts`）：首次高信用暂不限、信用跌破 80 或累犯→**7 天限制**（不可约充电位/月租位）、
+    信用跌破 60 或第 3 次→**30 天停约**；**押金不足产生挂账则补缴清前停约**；
+  - 车牌能匹配平台账号则计入其信用/押金并可在「押金与违约」自助补缴恢复；匹配不到则按车牌挂账，管理员可监管。
+- **新能源未充满补电补偿**（`computeRechargeCompensation` 纯函数）：离场填写实际电量，按
+  **缺口电量 × 1.2 元/kWh（能量补偿）+ 等待挪车/改派分钟 × 0.3 元（封顶 60 分钟，时间补偿）+ 替代桩绕行 10 元**
+  计算，平台先行现金垫付并随退款发放，终裁后向错占燃油车主追缴（押金没收冲抵、余额挂账）。
+- 车辆档案含**电池容量 kWh**（缺口电量换算）；预约充电位时可设**目标电量百分比**（缺省 90%）。
+- 押金流水 `deposit_transactions`（充值/没收/挂账补缴）与违约记录 `violation_records` 全程留痕，管理员「违约与押金」页可审计。
+
 ### 计费与收益分账（`src/domain/pricing.ts`，纯函数）
 合并清算：基础停车费（夜间封顶、按实际可用时长）、充电服务费、访客超时费（10 分钟宽限后 1.5×）、
 错停违约金、优惠券抵扣、异常现金补偿、赔付券（非现金）、业主补偿、退款、离场补缴；
@@ -136,18 +159,21 @@ npm run dev
 
 ## 五、本题的验证方式与结果（均已实际执行）
 
-### 后端单元测试（Jest，19 个用例全部通过）
+### 后端单元测试（Jest，34 个用例全部通过）
 ```bash
 cd backend && npm test
 ```
-- `test/pricing.spec.ts`（10 个）：夜间封顶、充电费、访客超时 1.5× 与信用 -3、业主回家实际时长计费+补偿+退款、
+- `test/pricing.spec.ts`（11 个）：夜间封顶、充电费、访客超时 1.5× 与信用 -3、业主回家实际时长计费+补偿+退款、
   车主错停违约金/业主补偿/信用 -10、陌生车平台兜底、优惠券封顶、70/10/20 分成、平台全责全额退款、
-  **四种裁决场景下资金流水借贷平衡**。
+  **四种裁决场景下资金流水借贷平衡**、**燃油车错占：补电补偿+押金没收/挂账追缴流水借贷平衡**。
+- `test/charging.spec.ts`（10 个）：补电补偿（缺口电量/等待封顶/已充满不补）、违约金押金充足没收、
+  信用 80/60 阶梯限制停约、累犯升级、押金不足挂账并停约、持有效预约不罚、后续预约资格判定。
+- `test/charging-appeal.spec.ts`（3 个）：桩编号+入场记录+照片判陌生燃油车责任、占用车持有效预约不判其违约、无证据不凭空归责。
 - `test/adjudication.spec.ts`（6 个）：车主错停、业主回家责任、陌生车+人工放行、识别失败+信号差平台责任、
   证据不足不作自动处罚、证据时间线排序。
 - `test/timeline.spec.ts`（3 个）：一晚相邻两单归属、陌生车占用段平台兜底/追缴归责、业主回家段业主自用与担责。
 
-### 真实数据库 + HTTP 端到端冒烟（53 项断言全部通过）
+### 真实数据库 + HTTP 端到端冒烟（82 项断言全部通过）
 对运行中的 NestJS（真实 PostgreSQL）执行 `node backend/seed/smoke.mjs`，用道闸时钟参数把事件锚定到"今晚"时间线，端到端覆盖：
 
 1. 四角色登录、业主发布 4 个车位、物业审核、车主按充电桩筛选；
@@ -160,13 +186,20 @@ cd backend && npm test
    **终裁后重算分账借贷仍平衡**、业主信用 -5；
 6. 订单 D：夜巡发现陌生车占用充电位 → 时间轴标注占用段（预约车主不计费/平台兜底/向陌生车主追缴）→
    判陌生车责任 → 服务费全免、平台垫付车主 20+业主 30、不影响预约车主信用；
-7. 共同追溯：全账户资金流水（含托管账户/券池）、调度总览、单订单全链路事件、六类证据档案、巡查照片留档。
+7. **订单 E（充电位错占专项，29 项断言）**：
+   燃油车注册账号/燃油车/押金 30 → 道闸外来车辆入场登记（燃油、无预约）→ 新能源车主预约充电位（目标 90%）入场 →
+   申诉强制校验照片/桩编号/到达时间 → 提交后**自动调取占用车入场记录入证据链**、判陌生燃油车责任 →
+   自动开工单 → 巡查补照片 → 物业**联系挪车**（通知送达占用车）→ 30 分钟后驶离 → 终裁 →
+   **执行违约：违约金 80、押金没收 30、挂账 50、信用 -15、停约** → 停约期内燃油车主预约被拒、押金清零、钱包显示限制、
+   管理员监管可查 → 新能源车主离场实际 40%：**补电补偿 45（能量 36+等待 9）、退款 56、押金没收入流水、借贷平衡** →
+   终裁重算仍平衡 → 燃油车主**补缴 50 后停约解除可再预约** → 档案含充电桩编号/入场记录/照片三类证据；
+8. 共同追溯：全账户资金流水（含托管账户/券池/违约车主账户）、调度总览、单订单全链路事件、六类证据档案、巡查照片留档。
 
-最近一次执行输出：`RESULT: 53 passed, 0 failed` / `SMOKE_OK`。
+最近一次执行输出：`RESULT: 82 passed, 0 failed` / `SMOKE_OK`。
 
 ### 前端验证
 - `cd frontend && npm run build`：TypeScript 类型检查 + Vite 生产构建通过（40 个模块）；
-- Vite dev server 下登录、`/api` 代理到后端实测通过，全部页面模块经 dev server 转换返回 200。
+- 车主工作台新增「⚡ 充电位错占申诉」「🔒 押金与违约」，物业新增外来车辆入场登记与申诉三动作处置，管理员新增「违约与押金」监管页；页面交互逻辑由后端 82 项端到端断言（含上述全部业务路径）覆盖。
 
 > 说明：本交付环境未安装 Docker daemon 与无头浏览器，因此 Docker 镜像构建与浏览器像素级截图未在本机执行；
 > Dockerfile/compose 已按多阶段构建标准编写，前端构建与后端编译均已在本机等价验证。
@@ -182,26 +215,31 @@ cd backend && npm test
 | 车辆·券 | `GET/POST /vehicles` `GET /coupons` `POST /coupons/issue` | 车主/管理员 |
 | 预约 | `POST /reservations` `GET /reservations` `GET /reservations/:id` `POST /reservations/:id/cancel` | 车主 |
 | 道闸·导航 | `POST /operations/gate/recognize` `POST /operations/gate/admit` `POST /operations/navigation/guidance` `POST /operations/reservations/:id/parked` `POST /operations/reservations/:id/report-signal` | 物业/车主 |
+| 入场台账 | `POST /operations/gate/access-log` `GET /operations/access-logs` | 物业登记/查询占用车入场记录 |
 | 巡查 | `GET/POST /operations/patrol` | 物业 |
 | 调度 | `GET /dispatch/incidents` `POST /dispatch/owner-return` `POST /dispatch/overstay` `POST /dispatch/incidents/:id/notify` `POST /dispatch/incidents/:id/resolve` `GET /dispatch/overview` | 业主/物业 |
 | 申诉 | `POST /appeals` `GET /appeals` `GET /appeals/:id` `POST /appeals/:id/evidence` `POST /appeals/:id/rule` `POST /appeals/:id/resettle` | 车主/物业 |
+| 充电位错占 | `POST /appeals/:id/disposition`（挪车/替代桩/免费） `POST /appeals/:id/enforce-violation`（执行燃油车违约） | 物业 |
+| 押金·违约 | `POST /wallet/deposit/topup` `GET /wallet` `GET /violations` `POST /violations/:id/repay` | 车主/管理员 |
 | 分账 | `POST /reservations/:id/exit` `GET /reservations/:id/quote` `GET /reservations/:id/settlement` `GET /ledger` `GET /spots/:id/timeline` | 按角色 |
 
 支持道闸时钟校准参数 `entry_at` / `parked_at` / `exit_at` / `occurred_at` / `resolved_at` / `patrolled_at`
-（现场设备补录、夜间订单复盘使用），时间轴支持 `?date=YYYY-MM-DD`（当晚 18:00~次日 09:00）或 `?start=&end=` 任意审计窗口。
+（现场设备补录、夜间订单复盘使用），离场结算支持 `charge_kwh` 与 `actual_charge_pct`（未充满补电补偿），
+时间轴支持 `?date=YYYY-MM-DD`（当晚 18:00~次日 09:00）或 `?start=&end=` 任意审计窗口。
 
 ## 七、目录结构
 
 ```
-139-a/
+139-feature-2-b/
 ├── docker-compose.yml          # 一键启动 db + backend + frontend
 ├── backend/
 │   ├── src/
-│   │   ├── domain/             # pricing 计费分账 / adjudication 证据裁决 / timeline 时间轴 / availability 时段
-│   │   ├── database/           # pg 连接池 + schema.sql（15 张表）
+│   │   ├── domain/             # pricing 计费分账 / adjudication 证据裁决 / charging 补电补偿·违约押金 / timeline 时间轴 / availability 时段
+│   │   ├── database/           # pg 连接池 + schema.sql（18 张表）
 │   │   ├── auth/ spots/ reservations/ operations/ dispatch/ appeals/ settlement/
-│   ├── test/                   # 19 个 Jest 单元测试
-│   └── seed/seed.js + smoke.mjs  # 种子数据 + 53 项端到端冒烟
+│   │   └── charging/           # 押金钱包、违约记录、物业处置、违约执行
+│   ├── test/                   # 34 个 Jest 单元测试
+│   └── seed/seed.js + smoke.mjs  # 种子数据 + 82 项端到端冒烟
 └── frontend/
     └── src/
         ├── App.tsx             # 登录 + 四角色路由

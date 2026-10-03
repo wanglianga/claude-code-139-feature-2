@@ -3,6 +3,7 @@ import { AuthGuard, CurrentUser, Roles } from '../auth/auth.guard';
 import { JwtUser } from '../auth/auth.service';
 import { DbService } from '../database/db.service';
 import { estimateFee, isIntervalCovered, ShareWindow } from '../domain/availability';
+import { checkBookingEligibility } from '../domain/charging';
 
 function code(prefix: string) {
   return `${prefix}${Date.now().toString(36).toUpperCase()}${Math.floor(Math.random() * 1e4)
@@ -16,6 +17,7 @@ class VehicleDto {
   is_new_energy?: boolean;
   is_monthly?: boolean;
   is_visitor?: boolean;
+  battery_capacity_kwh?: number;
 }
 
 class CreateReservationDto {
@@ -24,6 +26,7 @@ class CreateReservationDto {
   start_at: string;
   end_at: string;
   coupon_id?: number;
+  target_charge_pct?: number;
 }
 
 @Controller()
@@ -66,8 +69,12 @@ export class ReservationsController {
   addVehicle(@CurrentUser() user: JwtUser, @Body() dto: VehicleDto) {
     return this.db
       .query(
-        `INSERT INTO vehicles(user_id, plate, plate_color, is_new_energy, is_monthly, is_visitor)
-         VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+        `INSERT INTO vehicles(user_id, plate, plate_color, is_new_energy, is_monthly, is_visitor, battery_capacity_kwh)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)
+         ON CONFLICT (user_id, plate) DO UPDATE SET is_new_energy=EXCLUDED.is_new_energy,
+           is_monthly=EXCLUDED.is_monthly, is_visitor=EXCLUDED.is_visitor,
+           battery_capacity_kwh=COALESCE(EXCLUDED.battery_capacity_kwh, vehicles.battery_capacity_kwh)
+         RETURNING *`,
         [
           user.sub,
           dto.plate,
@@ -75,6 +82,7 @@ export class ReservationsController {
           dto.is_new_energy ?? false,
           dto.is_monthly ?? false,
           dto.is_visitor ?? false,
+          dto.is_new_energy && dto.battery_capacity_kwh ? Number(dto.battery_capacity_kwh) : null,
         ],
       )
       .then((r) => r.rows[0]);
@@ -147,6 +155,30 @@ export class ReservationsController {
       if (spot.near_charger && !vehicle.is_new_energy)
         throw new BadRequestException('带充电桩车位仅限新能源车辆预约');
 
+      // 违约记录限制：停约期内不可预约；限制期内不可约充电位/月租优先位
+      const vq = await this.db.query(
+        `SELECT booking_restriction, restriction_days, created_at, status, receivable
+         FROM violation_records WHERE user_id=$1 ORDER BY id DESC LIMIT 50`,
+        [user.sub],
+      );
+      const nowMs = Date.now();
+      const active = vq.rows
+        .map((x: any) => ({
+          restriction: x.booking_restriction,
+          nearCharger: !!spot.near_charger,
+          monthlyPriority: !!spot.monthly_priority,
+          active:
+            x.booking_restriction !== 'none' &&
+            (Number(x.receivable) > 0 ||
+              (x.status !== 'closed' && new Date(x.created_at).getTime() + Number(x.restriction_days) * 86400000 > nowMs)),
+        }))
+        .filter((x: any) => x.active);
+      const eligibility = checkBookingEligibility(active, {
+        nearCharger: !!spot.near_charger,
+        monthlyPriority: !!spot.monthly_priority,
+      });
+      if (!eligibility.ok) throw new BadRequestException(eligibility.reason);
+
       const fee = estimateFee(start, end, Number(spot.hourly_rate), spot.overnight_cap ? Number(spot.overnight_cap) : null);
 
       // 优惠券
@@ -165,11 +197,15 @@ export class ReservationsController {
       const priority = vehicle.is_monthly ? 'monthly' : 'normal';
       const prepaid = Math.round((fee - couponDiscount) * 100) / 100;
       const rCode = code('R');
+      const targetPct =
+        spot.near_charger && vehicle.is_new_energy && dto.target_charge_pct != null
+          ? Math.max(0, Math.min(100, Number(dto.target_charge_pct)))
+          : null;
       const ins = await c.query(
         `INSERT INTO reservations(code, spot_id, driver_id, vehicle_id, plate, start_at, end_at,
-           priority, estimated_fee)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-        [rCode, dto.spot_id, user.sub, dto.vehicle_id, vehicle.plate, start, end, priority, fee],
+           priority, estimated_fee, target_charge_pct)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+        [rCode, dto.spot_id, user.sub, dto.vehicle_id, vehicle.plate, start, end, priority, fee, targetPct],
       );
       const reservation = ins.rows[0];
 

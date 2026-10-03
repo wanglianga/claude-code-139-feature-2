@@ -63,6 +63,13 @@ export interface PriceInput {
   ruling?: Ruling | null;
   couponAmount?: number;
   prepaid: number;
+  // 充电位被燃油车错占：受害新能源车未充满的补电补偿（现金，经托管由平台先行垫付）
+  rechargeCompensation?: number;
+  // 燃油车主违约：押金没收金额 / 挂账追缴金额 / 肇事车主账号与车牌
+  violationForfeit?: number;
+  violationReceivable?: number;
+  violationUserId?: number | null;
+  violationPlate?: string | null;
 }
 
 export interface LedgerDraft {
@@ -82,9 +89,12 @@ export interface SettlementBreakdown {
   overtimeFee: number;
   wrongParkFine: number;
   couponDiscount: number;
-  abnormalCompensation: number; // 车主收到的补偿总额（现金 + 赔付券）
+  abnormalCompensation: number; // 车主收到的补偿总额（现金 + 赔付券 + 补电补偿）
   couponCompensation: number; // 赔付券（非现金，下次抵扣）
   ownerCompensation: number; // 业主收到的补偿（车主错停等）
+  rechargeCompensation: number; // 新能源未充满的补电补偿（现金，平台先行垫付）
+  depositForfeit: number; // 燃油车主违约被没收的押金（受偿，冲抵平台垫付）
+  violationRecovery: number; // 押金不足部分对肇事车主的挂账追缴
   prepaid: number;
   refund: number;
   exitCharge: number;
@@ -197,6 +207,14 @@ export function settlePrice(input: PriceInput): SettlementBreakdown {
     ownerCompensation += PRICING.ownerCompensationWrongPark;
     notes.push(`平台先行赔付业主 ¥${PRICING.ownerCompensationWrongPark}，向陌生车主追缴`);
   }
+
+  // ---- 新能源车因燃油车错占未充满：补电补偿（现金，平台先行垫付，终裁后向肇事燃油车主追缴）----
+  const rechargeComp = input.isNewEnergy ? round2(input.rechargeCompensation ?? 0) : 0;
+  if (rechargeComp > 0) {
+    cashCompensation += rechargeComp;
+    notes.push(`新能源车未充满，平台先行补偿补电费用 ¥${rechargeComp}（随退款发放，向错占燃油车主追缴）`);
+  }
+
   const abnormalCompensation = round2(cashCompensation + couponCompensation);
 
   // ---- 优惠券 ----
@@ -288,7 +306,7 @@ export function settlePrice(input: PriceInput): SettlementBreakdown {
   const gap = round2(escrowOutBeforePlatform - escrowIn);
   const platformTopup = Math.max(0, gap);
   const platformRetained = Math.max(0, -gap);
-  const platformFee = round2(platformRetained - platformTopup - strangerAdvance);
+  let platformFee = round2(platformRetained - platformTopup - strangerAdvance);
 
   // 1) 预约预付（车主 → 托管）
   if (prepaid > 0) ledger.push({ account: 'driver', direction: 'debit', amount: prepaid, memo: '预约预付（托管）' });
@@ -350,6 +368,24 @@ export function settlePrice(input: PriceInput): SettlementBreakdown {
     ledger.push({ account: 'owner', direction: 'credit', amount: strangerAdvance, memo: '业主补偿（陌生车占用，平台垫付）' });
   }
 
+  // 8) 燃油车错占：没收其押金用于归还平台先行垫付（补电补偿等）；押金不足的挂账追缴记违约台账，不做现金入账
+  const depositForfeit = round2(input.violationForfeit ?? 0);
+  const violationRecovery = round2(input.violationReceivable ?? 0);
+  if (depositForfeit > 0) {
+    platformFee = round2(platformFee + depositForfeit);
+    const violatorAccount = input.violationUserId ? `violator:${input.violationUserId}` : `violator:${input.violationPlate ?? 'unknown'}`;
+    ledger.push({
+      account: violatorAccount,
+      direction: 'debit',
+      amount: depositForfeit,
+      memo: `燃油车占充电位违约：没收押金（车牌 ${input.violationPlate ?? '待核'}）`,
+    });
+    ledger.push({ account: 'platform', direction: 'credit', amount: depositForfeit, memo: '违约押金没收，冲抵平台先行垫付的补电/异常补偿' });
+  }
+  if (violationRecovery > 0) {
+    notes.push(`肇事燃油车主押金不足，¥${violationRecovery} 挂账继续追缴（见违约记录），追缴到位前限制其预约权限`);
+  }
+
   ownerIncome = ownerTotal;
 
   durationMinutes = Math.round(durationMinutes);
@@ -367,6 +403,9 @@ export function settlePrice(input: PriceInput): SettlementBreakdown {
     abnormalCompensation,
     couponCompensation,
     ownerCompensation,
+    rechargeCompensation: rechargeComp,
+    depositForfeit,
+    violationRecovery,
     prepaid,
     refund,
     exitCharge,

@@ -10,8 +10,11 @@ export function SettlementView({ s }: { s: any }) {
     ['错停违约金', s.wrong_park_fine],
     ['优惠券抵扣', s.coupon_discount],
     ['异常补偿（现金+赔付券）', s.abnormal_compensation],
+    ['其中：未充满补电补偿', s.recharge_compensation],
     ['其中赔付券（非现金）', s.coupon_compensation],
     ['业主补偿', s.owner_compensation],
+    ['违约押金没收（向燃油车主追缴）', s.deposit_forfeit],
+    ['挂账继续追缴', s.violation_recovery],
     ['预约预付', s.prepaid],
   ];
   return (
@@ -282,6 +285,8 @@ const EVENT_LABEL: Record<string, string> = {
   settlement_recomputed: '分账重算',
   credit_adjusted: '信用调整',
   monthly_priority_conflict: '月租优先冲突',
+  ice_disposition: '充电位错占处置',
+  violation_enforced: '燃油车违约执行',
 };
 
 const EVENT_COLOR: Record<string, string> = {
@@ -289,6 +294,7 @@ const EVENT_COLOR: Record<string, string> = {
   owner_return_report: 'amber', weak_signal_report: 'amber', move_notice_sent: 'amber',
   gate_entry: 'cyan', parking_confirmed: 'green', settlement_completed: 'blue',
   appeal_ruled: 'purple', manual_release: 'purple', incident_resolved: 'green',
+  ice_disposition: 'cyan', violation_enforced: 'red',
 };
 
 export function ServiceEvents({ events }: { events: any[] }) {

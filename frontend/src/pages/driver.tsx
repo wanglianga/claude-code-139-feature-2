@@ -12,7 +12,8 @@ const NAV = [
   { key: 'browse', label: '找车位预约', icon: '🔍' },
   { key: 'active', label: '我的停车服务', icon: '🚗' },
   { key: 'vehicles', label: '车辆与优惠券', icon: '🎫' },
-  { key: 'appeals', label: '错停申诉', icon: '⚖️' },
+  { key: 'appeals', label: '充电位错占申诉', icon: '⚡' },
+  { key: 'wallet', label: '押金与违约', icon: '🔒' },
 ];
 
 export function DriverWorkspace({ session }: { session: Session }) {
@@ -23,6 +24,7 @@ export function DriverWorkspace({ session }: { session: Session }) {
       {tab === 'active' && <OrdersTab />}
       {tab === 'vehicles' && <VehiclesTab />}
       {tab === 'appeals' && <AppealsTab />}
+      {tab === 'wallet' && <WalletTab />}
     </WorkspaceShell>
   );
 }
@@ -111,6 +113,7 @@ function BookingModal({ spot, vehicles, coupons, onClose, onDone }: any) {
   const [start, setStart] = useState(toLocalInput(startDefault));
   const [end, setEnd] = useState(toLocalInput(endDefault));
   const [couponId, setCouponId] = useState<number | ''>('');
+  const [targetPct, setTargetPct] = useState(90);
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
 
@@ -119,6 +122,7 @@ function BookingModal({ spot, vehicles, coupons, onClose, onDone }: any) {
   const estimate = Math.min(Number(spot.overnight_cap ?? 1e9), Math.max(0, hours) * Number(spot.hourly_rate));
   const coupon = availableCoupons.find((c: any) => c.id === couponId);
   const prepaid = Math.max(0, estimate - Number(coupon?.amount ?? 0));
+  const isCharger = !!spot.near_charger;
 
   const submit = async () => {
     setErr(''); setBusy(true);
@@ -129,6 +133,7 @@ function BookingModal({ spot, vehicles, coupons, onClose, onDone }: any) {
         start_at: new Date(start).toISOString(),
         end_at: new Date(end).toISOString(),
         coupon_id: couponId || undefined,
+        target_charge_pct: isCharger ? targetPct : undefined,
       });
       onDone();
     } catch (e: any) {
@@ -166,6 +171,12 @@ function BookingModal({ spot, vehicles, coupons, onClose, onDone }: any) {
               {availableCoupons.map((c: any) => <option key={c.id} value={c.id}>{c.code}（{money(c.amount)}）</option>)}
             </select>
           </div>
+          {isCharger && (
+            <div className="field">
+              <label>目标充电量：{targetPct}%（到场被燃油车错占导致未充满时，按缺口计算补电补偿）</label>
+              <input type="range" min={50} max={100} step={5} value={targetPct} onChange={(e) => setTargetPct(Number(e.target.value))} />
+            </div>
+          )}
           <div className="alert info">
             <div className="fee-grid">
               <div className="row"><span>预估费用（{hours.toFixed(1)} 小时）</span><span className="money">{money(estimate)}</span></div>
@@ -229,6 +240,7 @@ function ServiceActionModal({ order, onClose, onChanged, onSettlement }: any) {
   const [rec, setRec] = useState<any>(null);
   const [actualSpot, setActualSpot] = useState(order.spot_code);
   const [signalArea, setSignalArea] = useState('B2 层');
+  const [actualPct, setActualPct] = useState(40);
 
   const act = async (fn: () => Promise<any>) => {
     setErr(''); setBusy(true);
@@ -269,7 +281,10 @@ function ServiceActionModal({ order, onClose, onChanged, onSettlement }: any) {
     return r;
   });
   const exit = async () => {
-    const r = await act(async () => api('POST', `/reservations/${order.id}/exit`, { charge_kwh: order.near_charger ? 20 : 0 }));
+    const r = await act(async () => api('POST', `/reservations/${order.id}/exit`, {
+      charge_kwh: order.near_charger ? 20 : 0,
+      actual_charge_pct: order.near_charger ? actualPct : undefined,
+    }));
     if (r) { onSettlement(order.id, r); onChanged(); }
   };
 
@@ -344,7 +359,15 @@ function ServiceActionModal({ order, onClose, onChanged, onSettlement }: any) {
                 系统将合并基础停车费{order.near_charger ? '、充电费' : ''}、超时/违约金、优惠券、异常补偿，
                 按 业主 70% / 物业 10% / 平台 20% 清算；预付多退少补。
               </div>
-              {order.near_charger && <div className="small muted" style={{ marginBottom: 8 }}>演示按充电 20kWh 结算（1.2 元/kWh）</div>}
+              {order.near_charger && (
+                <>
+                  <div className="small muted" style={{ marginBottom: 4 }}>演示按充电 20kWh 结算（1.2 元/kWh）</div>
+                  <div className="field">
+                    <label>离场实际电量：{actualPct}%（若本单充电位被燃油车错占且终裁成立，低于目标电量将计算补电补偿）</label>
+                    <input type="range" min={0} max={100} step={5} value={actualPct} onChange={(e) => setActualPct(Number(e.target.value))} />
+                  </div>
+                </>
+              )}
               <button className="btn success" disabled={busy || !['admitted', 'in_garage'].includes(order.status)} onClick={exit}>
                 道闸离场并查看清算单
               </button>
@@ -360,14 +383,17 @@ function ServiceActionModal({ order, onClose, onChanged, onSettlement }: any) {
 function VehiclesTab() {
   const { data: vehicles, reload } = useLoader<any[]>('/vehicles');
   const { data: coupons } = useLoader<any[]>('/coupons');
-  const [form, setForm] = useState({ plate: '', plate_color: '蓝牌', is_new_energy: false, is_monthly: false, is_visitor: false });
+  const [form, setForm] = useState({ plate: '', plate_color: '蓝牌', is_new_energy: false, is_monthly: false, is_visitor: false, battery_capacity_kwh: '' });
   const [err, setErr] = useState('');
 
   const submit = async () => {
     setErr('');
     try {
-      await api('POST', '/vehicles', form);
-      setForm({ plate: '', plate_color: '蓝牌', is_new_energy: false, is_monthly: false, is_visitor: false });
+      await api('POST', '/vehicles', {
+        ...form,
+        battery_capacity_kwh: form.is_new_energy && form.battery_capacity_kwh ? Number(form.battery_capacity_kwh) : undefined,
+      });
+      setForm({ plate: '', plate_color: '蓝牌', is_new_energy: false, is_monthly: false, is_visitor: false, battery_capacity_kwh: '' });
       reload();
     } catch (e: any) {
       setErr(e.message);
@@ -387,7 +413,7 @@ function VehiclesTab() {
                 {(vehicles ?? []).map((v) => (
                   <tr key={v.id}>
                     <td className="mono">{v.plate} <span className="small muted">{v.plate_color}</span></td>
-                    <td>{v.is_new_energy ? '新能源' : '燃油'}</td>
+                    <td>{v.is_new_energy ? `新能源${v.battery_capacity_kwh ? ` · ${v.battery_capacity_kwh}kWh` : ''}` : '燃油'}</td>
                     <td className="btn-row">
                       {v.is_monthly && <Tag cls="purple" label="月租" />}
                       {v.is_visitor && <Tag cls="cyan" label="访客" />}
@@ -414,6 +440,14 @@ function VehiclesTab() {
             <label className="checkbox"><input type="checkbox" checked={form.is_visitor} onChange={(e) => setForm({ ...form, is_visitor: e.target.checked })} />访客车</label>
             <button className="btn" onClick={submit} disabled={!form.plate}>登记车辆</button>
           </div>
+          {form.is_new_energy && (
+            <div className="field" style={{ marginTop: 10 }}>
+              <label>电池容量 kWh（用于未充满时计算补电补偿，如 60）</label>
+              <input type="number" value={form.battery_capacity_kwh}
+                onChange={(e) => setForm({ ...form, battery_capacity_kwh: e.target.value })}
+                placeholder="如 60" style={{ maxWidth: 220 }} />
+            </div>
+          )}
         </div>
         <div className="card">
           <h3>我的优惠券 <span className="hint">含异常赔付券</span></h3>
@@ -439,24 +473,28 @@ function VehiclesTab() {
 function AppealsTab() {
   const { data: appeals, reload } = useLoader<any[]>('/appeals');
   const { data: orders } = useLoader<any[]>('/reservations?scope=mine');
-  const [creating, setCreating] = useState(false);
+  const [creating, setCreating] = useState<'' | 'wrong_parking' | 'ice_charger'>('');
   const [openId, setOpenId] = useState<number | null>(null);
   const appealable = (orders ?? []).filter((o) => ['admitted', 'in_garage', 'completed'].includes(o.status));
 
   return (
     <div>
-      <PageHead title="错停申诉" desc="系统将自动汇聚车牌识别、预约、道闸日志、业主回家时间、物业巡查记录，结合你上传的现场照片给出责任建议" right={
-        <button className="btn" disabled={appealable.length === 0} onClick={() => setCreating(true)}>发起申诉</button>
+      <PageHead title="充电位错占申诉" desc="新能源车主预约带充电桩车位后被燃油车占用：上传现场照片、充电桩编号与到达时间，平台自动调取占用车辆入场记录；物业可联系挪车/安排替代桩/免除费用，未充满时计算补电补偿" right={
+        <span className="btn-row">
+          <button className="btn ghost" disabled={appealable.length === 0} onClick={() => setCreating('wrong_parking')}>普通错停申诉</button>
+          <button className="btn" disabled={appealable.length === 0} onClick={() => setCreating('ice_charger')}>⚡ 充电位被燃油车占用</button>
+        </span>
       } />
       <div className="card">
         {(appeals ?? []).length === 0 && <div className="empty">暂无申诉记录</div>}
         <div className="table-wrap">
           <table>
-            <thead><tr><th>申诉单</th><th>车位/车牌</th><th>事由</th><th>状态/裁决</th><th></th></tr></thead>
+            <thead><tr><th>申诉单</th><th>类型</th><th>车位/车牌</th><th>事由</th><th>状态/裁决</th><th></th></tr></thead>
             <tbody>
               {(appeals ?? []).map((a) => (
                 <tr key={a.id}>
                   <td className="mono small">{a.code}<div className="small muted">{dt(a.created_at)}</div></td>
+                  <td>{a.appeal_type === 'ice_charger' ? <Tag cls="purple" label="⚡ 燃油车占充电位" /> : <Tag cls="gray" label="普通错停" />}</td>
                   <td>{a.spot_code}<div className="small muted mono">{a.plate}</div></td>
                   <td className="small">{a.reason}</td>
                   <td><Tag status={a.status} /></td>
@@ -467,7 +505,7 @@ function AppealsTab() {
           </table>
         </div>
       </div>
-      {creating && <CreateAppealModal orders={appealable} onClose={() => setCreating(false)} onDone={() => { setCreating(false); reload(); }} />}
+      {creating && <CreateAppealModal type={creating} orders={appealable} onClose={() => setCreating('')} onDone={() => { setCreating(''); reload(); }} />}
       {openId && <AppealView id={openId} onClose={() => { setOpenId(null); reload(); }} />}
     </div>
   );
@@ -477,57 +515,138 @@ function AppealView({ id, onClose }: { id: number; onClose: () => void }) {
   return <AppealDetailModal id={id} onClose={onClose} />;
 }
 
-function CreateAppealModal({ orders, onClose, onDone }: any) {
-  const [reservationId, setReservationId] = useState(orders[0]?.id ?? '');
+function CreateAppealModal({ type, orders, onClose, onDone }: any) {
+  const ice = type === 'ice_charger';
+  const iceOrders = orders.filter((o: any) => o.near_charger);
+  const [reservationId, setReservationId] = useState((ice ? iceOrders[0]?.id : orders[0]?.id) ?? '');
   const [reason, setReason] = useState('');
   const [photoNote, setPhotoNote] = useState('');
+  const [photoUrl, setPhotoUrl] = useState(`evidence/ice-${Date.now()}.jpg`);
+  const [chargerCode, setChargerCode] = useState('');
+  const [arrivalAt, setArrivalAt] = useState(toLocalInput(new Date()));
+  const [occupierPlate, setOccupierPlate] = useState('');
+  const [targetPct, setTargetPct] = useState(90);
   const [err, setErr] = useState('');
   const [result, setResult] = useState<any>(null);
 
   const submit = async () => {
     setErr('');
     try {
-      const r = await api('POST', '/appeals', {
-        reservation_id: reservationId,
-        reason,
-        evidence: photoNote
-          ? [{ source: 'photo', title: '现场照片说明', content: photoNote, captured_at: new Date().toISOString(), stance: 'support' }]
-          : [],
-      });
-      setResult(r);
+      if (ice) {
+        const r = await api('POST', '/appeals', {
+          reservation_id: reservationId,
+          appeal_type: 'ice_charger',
+          reason: reason || '到场发现预约充电位被燃油车占用，无法充电',
+          photo_url: photoUrl,
+          charger_code: chargerCode,
+          arrival_at: new Date(arrivalAt).toISOString(),
+          occupier_plate: occupierPlate || undefined,
+          target_charge_pct: targetPct,
+        });
+        setResult(r);
+      } else {
+        const r = await api('POST', '/appeals', {
+          reservation_id: reservationId,
+          reason,
+          evidence: photoNote
+            ? [{ source: 'photo', title: '现场照片说明', content: photoNote, captured_at: new Date().toISOString(), stance: 'support' }]
+            : [],
+        });
+        setResult(r);
+      }
     } catch (e: any) {
       setErr(e.message);
     }
   };
 
+  const list = ice ? iceOrders : orders;
+
   return (
     <div className="modal-mask" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <div className="modal wide">
-        <div className="modal-head"><h3>发起错停申诉</h3><button className="close-x" onClick={onClose}>×</button></div>
+        <div className="modal-head"><h3>{ice ? '⚡ 充电位被燃油车占用申诉' : '发起错停申诉'}</h3><button className="close-x" onClick={onClose}>×</button></div>
         <div className="modal-body">
           {!result ? (
             <div>
               {err && <div className="alert error">{err}</div>}
+              {ice && list.length === 0 && (
+                <div className="alert error">没有可申诉的新能源充电位订单（需已入场/在场/已完成的充电位预约）</div>
+              )}
               <div className="field">
-                <label>关联停车服务单</label>
+                <label>关联充电位预约单</label>
                 <select value={reservationId} onChange={(e) => setReservationId(Number(e.target.value))}>
-                  {orders.map((o: any) => <option key={o.id} value={o.id}>{o.code} · {o.spot_code} · {o.plate} · {dt(o.start_at)}</option>)}
+                  {list.map((o: any) => <option key={o.id} value={o.id}>{o.code} · {o.spot_code} · {o.plate} · {dt(o.start_at)}</option>)}
                 </select>
               </div>
-              <div className="field">
-                <label>申诉事由</label>
-                <textarea value={reason} onChange={(e) => setReason(e.target.value)} placeholder="如：到场发现车位被陌生车占用 / 导航信号中断被引导至错误区域 / 业主临时回家要求挪车…" />
-              </div>
-              <div className="field">
-                <label>现场照片说明（上传 OSS 后在此描述照片内容与链接）</label>
-                <textarea value={photoNote} onChange={(e) => setPhotoNote(e.target.value)} placeholder="如：照片显示车位标牌 B2-109，地面箭头磨损；附件 evidence/xxx.jpg" />
-              </div>
-              <div className="alert info">提交后系统立即自动分析：车牌识别记录、预约记录、道闸日志、业主回家上报时间、物业巡查档案与你的陈述/照片。</div>
-              <button className="btn" disabled={!reason} onClick={submit}>提交申诉并查看自动责任分析</button>
+
+              {ice ? (
+                <>
+                  <div className="grid grid-2">
+                    <div className="field">
+                      <label>现场充电桩编号 *</label>
+                      <input value={chargerCode} onChange={(e) => setChargerCode(e.target.value)} placeholder="如 CHG-B2-03" />
+                    </div>
+                    <div className="field">
+                      <label>到达时间 *</label>
+                      <input type="datetime-local" value={arrivalAt} onChange={(e) => setArrivalAt(e.target.value)} />
+                    </div>
+                  </div>
+                  <div className="grid grid-2">
+                    <div className="field">
+                      <label>占用车辆车牌（燃油车，填写后自动调取其入场记录）</label>
+                      <input className="mono" value={occupierPlate} onChange={(e) => setOccupierPlate(e.target.value.toUpperCase())} placeholder="如 沪A98765（可留空，由巡查补录）" />
+                    </div>
+                    <div className="field">
+                      <label>预约目标电量：{targetPct}%</label>
+                      <input type="range" min={50} max={100} step={5} value={targetPct} onChange={(e) => setTargetPct(Number(e.target.value))} />
+                    </div>
+                  </div>
+                  <div className="field">
+                    <label>现场照片 *（上传 OSS 后的附件名/链接）</label>
+                    <input value={photoUrl} onChange={(e) => setPhotoUrl(e.target.value)} placeholder="evidence/xxx.jpg" />
+                    <div className="small muted">照片需清晰拍到：被占充电位、充电桩编号、占用车辆（含车牌）与车辆非新能源特征</div>
+                  </div>
+                  <div className="field">
+                    <label>情况说明</label>
+                    <textarea value={reason} onChange={(e) => setReason(e.target.value)} placeholder="如：到达 B2-108，充电桩 CHG-B2-03 被一辆黑色燃油车占用，等待 30 分钟仍未挪车，最终未能充满" />
+                  </div>
+                  <div className="alert info">
+                    提交后平台将：① 汇聚你的现场照片、充电桩编号、到达时间；② 自动调取占用车辆的道闸入场记录（核验是否燃油车、有无有效预约）；
+                    ③ 推送物业接单处置（联系挪车 / 安排替代充电桩 / 免除预约费用）；④ 终裁后对无有效预约的燃油车记违约（违约金、押金、信用与预约权限）；
+                    ⑤ 若因此未充满，离场结算时自动计算补电补偿（缺口电量 + 等待时长 + 替代桩绕行）。
+                  </div>
+                  <button className="btn" disabled={!chargerCode || list.length === 0} onClick={submit}>提交充电位错占申诉</button>
+                </>
+              ) : (
+                <>
+                  <div className="field">
+                    <label>关联停车服务单</label>
+                    <select value={reservationId} onChange={(e) => setReservationId(Number(e.target.value))}>
+                      {orders.map((o: any) => <option key={o.id} value={o.id}>{o.code} · {o.spot_code} · {o.plate} · {dt(o.start_at)}</option>)}
+                    </select>
+                  </div>
+                  <div className="field">
+                    <label>申诉事由</label>
+                    <textarea value={reason} onChange={(e) => setReason(e.target.value)} placeholder="如：到场发现车位被陌生车占用 / 导航信号中断被引导至错误区域 / 业主临时回家要求挪车…" />
+                  </div>
+                  <div className="field">
+                    <label>现场照片说明（上传 OSS 后在此描述照片内容与链接）</label>
+                    <textarea value={photoNote} onChange={(e) => setPhotoNote(e.target.value)} placeholder="如：照片显示车位标牌 B2-109，地面箭头磨损；附件 evidence/xxx.jpg" />
+                  </div>
+                  <div className="alert info">提交后系统立即自动分析：车牌识别记录、预约记录、道闸日志、业主回家上报时间、物业巡查档案与你的陈述/照片。</div>
+                  <button className="btn" disabled={!reason} onClick={submit}>提交申诉并查看自动责任分析</button>
+                </>
+              )}
             </div>
           ) : (
             <div>
-              <div className="alert ok">申诉已受理（{result.appeal.code}），自动责任分析已生成，物业将据此终裁</div>
+              <div className="alert ok">申诉已受理（{result.appeal.code}），自动责任分析已生成，物业将据此处置与终裁</div>
+              {ice && (
+                <div className="alert info">
+                  占用车辆：{result.adjudication.occupierPlate ?? '车牌待核（等待物业巡查补录）'}；
+                  建议结论：<RulingTagInline ruling={result.adjudication.ruling} />
+                </div>
+              )}
               <pre className="small" style={{ whiteSpace: 'pre-wrap' }}>
                 建议结论：{result.adjudication.ruling}（置信度 {Math.round(result.adjudication.confidence * 100)}%）{'\n'}
                 {result.adjudication.reasons.join('\n')}
@@ -535,6 +654,95 @@ function CreateAppealModal({ orders, onClose, onDone }: any) {
               <button className="btn" onClick={onDone}>完成</button>
             </div>
           )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RulingTagInline({ ruling }: { ruling: string }) {
+  const map: Record<string, string> = { stranger: '陌生燃油车主责任', driver_fault: '车主责任', mixed: '混合责任', no_fault: '存疑/无责' };
+  return <b>{map[ruling] ?? ruling}</b>;
+}
+
+// ---------- 押金与违约 ----------
+function WalletTab() {
+  const { data, reload } = useLoader<any>('/wallet');
+  const [amount, setAmount] = useState(100);
+  const [msg, setMsg] = useState('');
+  const [err, setErr] = useState('');
+
+  const topup = async () => {
+    setErr(''); setMsg('');
+    try {
+      await api('POST', '/wallet/deposit/topup', { amount });
+      setMsg(`押金充值 ${money(amount)} 成功`);
+      reload();
+    } catch (e: any) { setErr(e.message); }
+  };
+  const repay = async (id: number) => {
+    setErr(''); setMsg('');
+    try {
+      await api('POST', `/violations/${id}/repay`, {});
+      setMsg('挂账已补缴，押金余额更新，预约权限恢复');
+      reload();
+    } catch (e: any) { setErr(e.message); }
+  };
+
+  return (
+    <div>
+      <PageHead title="押金与违约" desc="押金用于违约情形下的资金保障；燃油车无有效预约占用充电位将被没收押金/记违约，影响后续预约权限，可在此补缴恢复" />
+      {msg && <div className="alert ok">{msg}</div>}
+      {err && <div className="alert error">{err}</div>}
+      <div className="grid grid-3" style={{ marginBottom: 16 }}>
+        <div className="stat"><div className="label">押金余额</div><div className="value">{money(data?.deposit_balance ?? 0)}</div></div>
+        <div className="stat"><div className="label">信用分</div><div className="value">{data?.credit_score ?? 100}</div></div>
+        <div className="stat"><div className="label">生效违约限制</div>
+          <div className="value" style={{ color: (data?.active_restrictions?.length ?? 0) ? 'var(--red)' : undefined }}>{data?.active_restrictions?.length ?? 0}</div></div>
+      </div>
+      <div className="grid grid-2">
+        <div className="card">
+          <h3>押金充值</h3>
+          <div className="btn-row">
+            <input type="number" value={amount} onChange={(e) => setAmount(Number(e.target.value))} style={{ maxWidth: 160 }} />
+            <button className="btn" onClick={topup}>充值押金</button>
+          </div>
+          <div className="small muted" style={{ marginTop: 8 }}>押金用于充电位等场景的违约保障；无违约时可申请退还（演示环境不提供退款入口）。</div>
+          <h3 style={{ marginTop: 16 }}>押金流水</h3>
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>时间</th><th>类型</th><th>金额</th><th>摘要</th></tr></thead>
+              <tbody>
+                {(data?.transactions ?? []).map((t: any) => (
+                  <tr key={t.id}>
+                    <td className="small">{dt(t.created_at)}</td>
+                    <td>{t.direction === 'topup' ? '充值' : t.direction === 'deduct' ? '违约没收' : t.direction === 'repay' ? '挂账补缴' : '退还'}</td>
+                    <td className="money">{money(t.amount)}</td>
+                    <td className="small">{t.memo}</td>
+                  </tr>
+                ))}
+                {(data?.transactions ?? []).length === 0 && <tr><td colSpan={4} className="empty">暂无流水</td></tr>}
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div className="card">
+          <h3>我的违约记录</h3>
+          {(data?.violations ?? []).length === 0 && <div className="empty">暂无违约记录</div>}
+          {(data?.violations ?? []).map((v: any) => (
+            <div key={v.id} className={`ticket-card ${v.booking_restriction === 'blocked' ? 'open' : v.booking_restriction === 'restricted' ? 'notified' : 'resolved'}`}>
+              <div className="ticket-head">
+                <span className="ticket-title mono">{v.code} · {v.plate}</span>
+                <Tag cls={v.booking_restriction === 'blocked' ? 'red' : v.booking_restriction === 'restricted' ? 'amber' : 'green'}
+                  label={v.booking_restriction === 'blocked' ? '停约' : v.booking_restriction === 'restricted' ? '限制预约' : '无限制'} />
+              </div>
+              <div className="ticket-desc small">{v.note}</div>
+              <div className="small muted">
+                违约金 {money(v.fine)} · 押金没收 {money(v.deposit_deducted)} · 挂账待缴 {money(v.receivable)} · 信用 {v.credit_delta}
+              </div>
+              {Number(v.receivable) > 0 && <button className="btn sm danger" style={{ marginTop: 6 }} onClick={() => repay(v.id)}>补缴挂账 {money(v.receivable)} 恢复预约</button>}
+            </div>
+          ))}
         </div>
       </div>
     </div>

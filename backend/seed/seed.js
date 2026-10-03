@@ -113,6 +113,24 @@ async function main() {
   await vehicle(driver.id, '沪AD88899', { color: '绿牌', ne: true, monthly: true });
   await vehicle(driver2.id, '沪A12345', { visitor: true });
 
+  // 新能源车补充电池容量（用于未充满补电补偿换算）；幂等回填
+  await pool.query(
+    `UPDATE vehicles SET battery_capacity_kwh=60 WHERE plate='沪AD88899' AND battery_capacity_kwh IS NULL`,
+  );
+
+  // 车主初始押金（幂等：仅在尚无充值流水时写入 100 元押金）
+  await pool.query(
+    `INSERT INTO deposit_transactions(user_id, direction, amount, memo)
+     SELECT $1, 'topup', 100, '初始押金（种子）'
+     WHERE NOT EXISTS (SELECT 1 FROM deposit_transactions WHERE user_id=$1 AND direction='topup')`,
+    [driver.id],
+  );
+  await pool.query(
+    `UPDATE users SET deposit_balance=100 WHERE id=$1 AND deposit_balance=0
+       AND EXISTS (SELECT 1 FROM deposit_transactions WHERE user_id=$1 AND direction='topup')`,
+    [driver.id],
+  );
+
   // 优惠券
   await pool.query(
     `INSERT INTO coupons(user_id, code, amount)

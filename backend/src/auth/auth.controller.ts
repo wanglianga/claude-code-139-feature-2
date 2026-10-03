@@ -33,7 +33,7 @@ export class AuthController {
   @Get('me')
   async me(@CurrentUser() user: JwtUser) {
     const { rows } = await this.db.query(
-      `SELECT id, username, name, role, phone, credit_score FROM users WHERE id=$1`,
+      `SELECT id, username, name, role, phone, credit_score, deposit_balance FROM users WHERE id=$1`,
       [user.sub],
     );
     return rows[0];
